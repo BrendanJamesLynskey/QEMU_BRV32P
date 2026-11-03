@@ -1,0 +1,5 @@
+# Fetched QEMU sources, build tree and test output: all rebuilt by scripts/build.sh
+/.cache/
+/build/
+tests/build/
+__pycache__/

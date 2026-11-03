@@ -12,10 +12,17 @@ The repo is a **patch series against a pinned QEMU release**, not a QEMU tree. T
 
 | Step | What | State |
 |---|---|---|
-| Q0 | design note, taken from the RTL | PR `q0-design` |
+| Q0 | [design note](docs/design.md), taken from the RTL | PR `q0-design` |
 | Q1 | the machine, the three peripherals, ELF loading with `tohost` exit; tests and CI | PR `q1-machine` |
 | Q2 | the custom extensions (Xbrvdsp, GF, mod-q) | not started |
 | Q3 | one ELF on QEMU, Spike and RTL in CI | not started |
+
+## Layout
+
+| Path | Contents |
+|---|---|
+| [`docs/design.md`](docs/design.md) | the design note: memory map, registers, interrupts, boot, how tests end, scope, Q2 and Q3 outline |
+| [`docs/pr/q0-design.md`](docs/pr/q0-design.md) | the pull request body |
 
 ## Licence
 

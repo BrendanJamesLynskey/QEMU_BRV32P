@@ -1,0 +1,69 @@
+From ee1a8a9c8f9862c085b1bb915f6a6ee82fcdff04 Mon Sep 17 00:00:00 2001
+From: Brendan Lynskey <brendanlynskey@googlemail.com>
+Date: Tue, 3 Nov 2026 01:17:59 +0000
+Subject: [PATCH 6/6] target/riscv: trap on misaligned loads and stores for the
+ BRV32P
+
+The BRV32P does not do misaligned accesses in hardware: a load or store
+whose address is not aligned to its size raises a load or store address
+misaligned exception, as the privileged specification allows. Add an
+internal CPU option, not exposed as a property, that makes the translator
+align-check plain loads and stores, and set it for the BRV32P.
+
+Signed-off-by: Brendan Lynskey <brendanlynskey@googlemail.com>
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ target/riscv/cpu.c                          | 1 +
+ target/riscv/cpu_cfg_fields.h.inc           | 1 +
+ target/riscv/tcg/insn_trans/trans_rvi.c.inc | 6 ++++++
+ 3 files changed, 8 insertions(+)
+
+diff --git a/target/riscv/cpu.c b/target/riscv/cpu.c
+index 7f31e2f..19e1764 100644
+--- a/target/riscv/cpu.c
++++ b/target/riscv/cpu.c
+@@ -3303,6 +3303,7 @@ static const TypeInfo riscv_cpu_type_infos[] = {
+         .cfg.max_satp_mode = VM_1_10_MBARE,
+         .cfg.ext_zifencei = true,
+         .cfg.ext_zicsr = true,
++        .cfg.misaligned_trap = true,
+ 
+         .cfg.ext_zbkb = true,
+         .cfg.ext_zbkc = true,
+diff --git a/target/riscv/cpu_cfg_fields.h.inc b/target/riscv/cpu_cfg_fields.h.inc
+index 9eb47af..6da7906 100644
+--- a/target/riscv/cpu_cfg_fields.h.inc
++++ b/target/riscv/cpu_cfg_fields.h.inc
+@@ -67,6 +67,7 @@ BOOL_FIELD(ext_zdinx)
+ BOOL_FIELD(ext_zaamo)
+ BOOL_FIELD(ext_zacas)
+ BOOL_FIELD(ext_zama16b)
++BOOL_FIELD(misaligned_trap)
+ BOOL_FIELD(ext_zabha)
+ BOOL_FIELD(ext_zalasr)
+ BOOL_FIELD(ext_zalrsc)
+diff --git a/target/riscv/tcg/insn_trans/trans_rvi.c.inc b/target/riscv/tcg/insn_trans/trans_rvi.c.inc
+index e47b16a..b5475b1 100644
+--- a/target/riscv/tcg/insn_trans/trans_rvi.c.inc
++++ b/target/riscv/tcg/insn_trans/trans_rvi.c.inc
+@@ -413,6 +413,9 @@ static bool gen_load(DisasContext *ctx, arg_lb *a, MemOp memop)
+     if (ctx->cfg_ptr->ext_zama16b) {
+         memop |= MO_ATOM_WITHIN16;
+     }
++    if (ctx->cfg_ptr->misaligned_trap) {
++        memop |= MO_ALIGN;
++    }
+     decode_save_opc(ctx, 0);
+     if (get_xl(ctx) == MXL_RV128) {
+         out = gen_load_i128(ctx, a, memop);
+@@ -524,6 +527,9 @@ static bool gen_store(DisasContext *ctx, arg_sb *a, MemOp memop)
+     if (ctx->cfg_ptr->ext_zama16b) {
+         memop |= MO_ATOM_WITHIN16;
+     }
++    if (ctx->cfg_ptr->misaligned_trap) {
++        memop |= MO_ALIGN;
++    }
+     decode_save_opc(ctx, 0);
+     if (get_xl(ctx) == MXL_RV128) {
+         return gen_store_i128(ctx, a, memop);

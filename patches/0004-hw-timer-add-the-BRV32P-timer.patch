@@ -1,0 +1,456 @@
+From 45176eb0f427e523cffc853307bd9803d2b01d0f Mon Sep 17 00:00:00 2001
+From: Brendan Lynskey <brendanlynskey@googlemail.com>
+Date: Tue, 3 Nov 2026 01:17:59 +0000
+Subject: [PATCH 4/6] hw/timer: add the BRV32P timer
+
+A model of the timer of the BRV32P SoC: a prescaler, a compare register and
+an auto-reload counter, with a sticky match flag that is the timer
+interrupt. The counters are brought up to date from virtual time on each
+access, and a QEMU timer is set for the match.
+
+Signed-off-by: Brendan Lynskey <brendanlynskey@googlemail.com>
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/timer/Kconfig                |   3 +
+ hw/timer/brv32p_timer.c         | 339 ++++++++++++++++++++++++++++++++
+ hw/timer/meson.build            |   1 +
+ include/hw/timer/brv32p_timer.h |  58 ++++++
+ 4 files changed, 401 insertions(+)
+ create mode 100644 hw/timer/brv32p_timer.c
+ create mode 100644 include/hw/timer/brv32p_timer.h
+
+diff --git a/hw/timer/Kconfig b/hw/timer/Kconfig
+index b3d823c..dfef002 100644
+--- a/hw/timer/Kconfig
++++ b/hw/timer/Kconfig
+@@ -33,6 +33,9 @@ config PXA2XX_TIMER
+ config SIFIVE_PWM
+     bool
+ 
++config BRV32P_TIMER
++    bool
++
+ config STM32F2XX_TIMER
+     bool
+ 
+diff --git a/hw/timer/brv32p_timer.c b/hw/timer/brv32p_timer.c
+new file mode 100644
+index 0000000..74bd578
+--- /dev/null
++++ b/hw/timer/brv32p_timer.c
+@@ -0,0 +1,339 @@
++/*
++ * BRV32P timer
++ *
++ * Copyright (c) 2026 Brendan Lynskey
++ *
++ * Register-exact model of rtl/periph/timer.v. The RTL counts clock cycles; so
++ * that QEMU does not wake up on every one, the counters are brought up to date
++ * from virtual time when a register is read or written, and a QEMU timer
++ * is set for the cycle on which the match flag will be set.
++ *
++ * In the RTL, every (prescaler + 1) cycles while enabled a "tick" takes place:
++ *   if (count >= compare) { match_flag = 1; if (auto_reload) count = 0; }
++ *   else count++;
++ * so with compare = N the flag is set on tick number N + 1, counting from a
++ * count of 0.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "qapi/error.h"
++#include "qemu/log.h"
++#include "qemu/host-utils.h"
++#include "qemu/timer.h"
++#include "hw/core/irq.h"
++#include "hw/core/qdev-properties.h"
++#include "hw/timer/brv32p_timer.h"
++#include "migration/vmstate.h"
++
++#define BRV32P_CLOCK_FREQ_DEFAULT 100000000   /* the 100 MHz the RTL targets */
++
++static uint64_t brv32p_timer_now_cycles(BRV32PTimerState *s)
++{
++    return muldiv64(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), s->freq,
++                    NANOSECONDS_PER_SECOND);
++}
++
++static void brv32p_timer_update_irq(BRV32PTimerState *s)
++{
++    /* assign irq = match_flag; */
++    qemu_set_irq(s->irq, s->match_flag);
++}
++
++/* Apply @ticks counter ticks to count and match_flag */
++static void brv32p_timer_ticks(BRV32PTimerState *s, uint64_t ticks)
++{
++    uint64_t need;
++
++    if (!ticks) {
++        return;
++    }
++    if (s->count >= s->compare) {
++        s->match_flag = true;
++        if (!s->auto_reload) {
++            return;                  /* count stays where it is */
++        }
++        s->count = 0;
++        ticks--;
++        if (!s->compare) {
++            return;                  /* count >= compare on every tick */
++        }
++    }
++    /* count < compare: it takes (compare - count) ticks to reach it */
++    need = s->compare - s->count;
++    if (ticks <= need) {
++        s->count += ticks;
++        return;
++    }
++    ticks -= need;
++    s->count = s->compare;
++    /* The next tick sets the flag */
++    s->match_flag = true;
++    ticks--;
++    if (!s->auto_reload) {
++        return;
++    }
++    /* After the reload it takes compare + 1 ticks to come round again */
++    s->count = 0;
++    ticks %= (uint64_t)s->compare + 1;
++    s->count = ticks;
++}
++
++/* Bring the registers up to the current cycle */
++static void brv32p_timer_sync(BRV32PTimerState *s)
++{
++    uint64_t now = brv32p_timer_now_cycles(s);
++    uint64_t edges = now - s->last_cycle;
++    uint64_t period, first, ticks;
++
++    s->last_cycle = now;
++    if (!s->enable || !edges) {
++        return;
++    }
++
++    period = (uint64_t)s->prescaler + 1;
++    if (s->pre_cnt > s->prescaler) {
++        /* pre_cnt >= prescaler: reset without a tick */
++        s->pre_cnt = 0;
++        edges--;
++    }
++    /* The first tick is on the edge when pre_cnt equals prescaler */
++    first = s->prescaler - s->pre_cnt + 1;
++    if (edges < first) {
++        s->pre_cnt += edges;
++        return;
++    }
++    ticks = 1 + (edges - first) / period;
++    s->pre_cnt = (edges - first) % period;
++    brv32p_timer_ticks(s, ticks);
++}
++
++/* Set the QEMU timer for the edge the match flag will be set on */
++static void brv32p_timer_arm(BRV32PTimerState *s)
++{
++    uint64_t period = (uint64_t)s->prescaler + 1;
++    uint64_t ticks, edges;
++
++    if (!s->enable || s->match_flag) {
++        timer_del(s->timer);
++        return;
++    }
++    ticks = (s->count >= s->compare) ? 1 : (uint64_t)(s->compare - s->count) + 1;
++    if (s->pre_cnt > s->prescaler) {
++        edges = 1 + period;
++    } else {
++        edges = s->prescaler - s->pre_cnt + 1;
++    }
++    edges += (ticks - 1) * period;
++    timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
++              muldiv64(edges, NANOSECONDS_PER_SECOND, s->freq) + 1);
++}
++
++static void brv32p_timer_expired(void *opaque)
++{
++    BRV32PTimerState *s = opaque;
++
++    brv32p_timer_sync(s);
++    brv32p_timer_update_irq(s);
++    brv32p_timer_arm(s);
++}
++
++static uint32_t brv32p_timer_reg_read(BRV32PTimerState *s, hwaddr reg)
++{
++    brv32p_timer_sync(s);
++
++    switch (reg) {
++    case BRV32P_TIMER_CTRL:
++        return (s->auto_reload << 1) | s->enable;
++    case BRV32P_TIMER_PRESCALER:
++        return s->prescaler;
++    case BRV32P_TIMER_COMPARE:
++        return s->compare;
++    case BRV32P_TIMER_COUNT:
++        return s->count;
++    case BRV32P_TIMER_STATUS:
++        return s->match_flag;
++    default:
++        return 0;
++    }
++}
++
++static void brv32p_timer_reg_write(BRV32PTimerState *s, hwaddr reg,
++                                   uint32_t val)
++{
++    brv32p_timer_sync(s);
++
++    switch (reg) {
++    case BRV32P_TIMER_CTRL:
++        s->enable = val & BRV32P_TIMER_CTRL_ENABLE;
++        s->auto_reload = !!(val & BRV32P_TIMER_CTRL_AUTO_RELOAD);
++        break;
++    case BRV32P_TIMER_PRESCALER:
++        s->prescaler = val;
++        break;
++    case BRV32P_TIMER_COMPARE:
++        s->compare = val;
++        break;
++    case BRV32P_TIMER_COUNT:
++        s->count = val;
++        break;
++    case BRV32P_TIMER_STATUS:
++        s->match_flag &= !(val & 1);     /* write 1 to clear */
++        break;
++    default:
++        break;
++    }
++    brv32p_timer_update_irq(s);
++    brv32p_timer_arm(s);
++}
++
++/*
++ * The bridge hands the peripheral a whole 32-bit word whatever the width of
++ * the store: the D-cache replicates a byte or a halfword across the word and
++ * the bridge ignores the byte strobes. Loads take their bytes from the word.
++ */
++static uint64_t brv32p_timer_read(void *opaque, hwaddr addr, unsigned size)
++{
++    BRV32PTimerState *s = opaque;
++    uint32_t word = brv32p_timer_reg_read(s, addr & 0x1c);
++
++    return (word >> ((addr & 3) * 8)) & MAKE_64BIT_MASK(0, size * 8);
++}
++
++static void brv32p_timer_write(void *opaque, hwaddr addr, uint64_t val,
++                               unsigned size)
++{
++    BRV32PTimerState *s = opaque;
++    uint32_t word;
++
++    switch (size) {
++    case 1:
++        word = (val & 0xff) * 0x01010101u;
++        break;
++    case 2:
++        word = (val & 0xffff) * 0x00010001u;
++        break;
++    default:
++        word = val;
++        break;
++    }
++    brv32p_timer_reg_write(s, addr & 0x1c, word);
++}
++
++static const MemoryRegionOps brv32p_timer_ops = {
++    .read = brv32p_timer_read,
++    .write = brv32p_timer_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = {
++        .min_access_size = 1,
++        .max_access_size = 4,
++    },
++    .impl = {
++        .min_access_size = 1,
++        .max_access_size = 4,
++    },
++};
++
++static void brv32p_timer_reset_enter(Object *obj, ResetType type)
++{
++    BRV32PTimerState *s = BRV32P_TIMER(obj);
++
++    s->enable = false;
++    s->auto_reload = false;
++    s->prescaler = 0;
++    s->compare = 0xffffffff;
++    s->count = 0;
++    s->pre_cnt = 0;
++    s->match_flag = false;
++    s->last_cycle = brv32p_timer_now_cycles(s);
++    timer_del(s->timer);
++}
++
++static void brv32p_timer_reset_hold(Object *obj, ResetType type)
++{
++    BRV32PTimerState *s = BRV32P_TIMER(obj);
++
++    qemu_irq_lower(s->irq);
++}
++
++static void brv32p_timer_realize(DeviceState *dev, Error **errp)
++{
++    BRV32PTimerState *s = BRV32P_TIMER(dev);
++
++    if (!s->freq) {
++        error_setg(errp, "brv32p-timer: clock-frequency must not be zero");
++        return;
++    }
++    s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, brv32p_timer_expired, s);
++}
++
++static void brv32p_timer_unrealize(DeviceState *dev)
++{
++    BRV32PTimerState *s = BRV32P_TIMER(dev);
++
++    timer_free(s->timer);
++}
++
++static void brv32p_timer_init(Object *obj)
++{
++    SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
++    BRV32PTimerState *s = BRV32P_TIMER(obj);
++
++    memory_region_init_io(&s->mmio, obj, &brv32p_timer_ops, s,
++                          TYPE_BRV32P_TIMER, BRV32P_TIMER_MMIO_SIZE);
++    sysbus_init_mmio(sbd, &s->mmio);
++    sysbus_init_irq(sbd, &s->irq);
++}
++
++static const Property brv32p_timer_properties[] = {
++    DEFINE_PROP_UINT64("clock-frequency", BRV32PTimerState, freq,
++                       BRV32P_CLOCK_FREQ_DEFAULT),
++};
++
++static const VMStateDescription vmstate_brv32p_timer = {
++    .name = TYPE_BRV32P_TIMER,
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_BOOL(enable, BRV32PTimerState),
++        VMSTATE_BOOL(auto_reload, BRV32PTimerState),
++        VMSTATE_UINT32(prescaler, BRV32PTimerState),
++        VMSTATE_UINT32(compare, BRV32PTimerState),
++        VMSTATE_UINT32(count, BRV32PTimerState),
++        VMSTATE_UINT32(pre_cnt, BRV32PTimerState),
++        VMSTATE_BOOL(match_flag, BRV32PTimerState),
++        VMSTATE_UINT64(last_cycle, BRV32PTimerState),
++        VMSTATE_TIMER_PTR(timer, BRV32PTimerState),
++        VMSTATE_END_OF_LIST()
++    },
++};
++
++static void brv32p_timer_class_init(ObjectClass *oc, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(oc);
++    ResettableClass *rc = RESETTABLE_CLASS(oc);
++
++    dc->realize = brv32p_timer_realize;
++    dc->unrealize = brv32p_timer_unrealize;
++    dc->vmsd = &vmstate_brv32p_timer;
++    rc->phases.enter = brv32p_timer_reset_enter;
++    rc->phases.hold = brv32p_timer_reset_hold;
++    device_class_set_props(dc, brv32p_timer_properties);
++    set_bit(DEVICE_CATEGORY_MISC, dc->categories);
++}
++
++static const TypeInfo brv32p_timer_info = {
++    .name          = TYPE_BRV32P_TIMER,
++    .parent        = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(BRV32PTimerState),
++    .instance_init = brv32p_timer_init,
++    .class_init    = brv32p_timer_class_init,
++};
++
++static void brv32p_timer_register_types(void)
++{
++    type_register_static(&brv32p_timer_info);
++}
++
++type_init(brv32p_timer_register_types)
+diff --git a/hw/timer/meson.build b/hw/timer/meson.build
+index 201b5d8..5f27263 100644
+--- a/hw/timer/meson.build
++++ b/hw/timer/meson.build
+@@ -32,5 +32,6 @@ system_ss.add(when: 'CONFIG_STM32F2XX_TIMER', if_true: files('stm32f2xx_timer.c'
+ system_ss.add(when: 'CONFIG_XILINX', if_true: files('xilinx_timer.c'))
+ specific_ss.add(when: 'CONFIG_IBEX', if_true: files('ibex_timer.c'))
+ system_ss.add(when: 'CONFIG_SIFIVE_PWM', if_true: files('sifive_pwm.c'))
++system_ss.add(when: 'CONFIG_BRV32P_TIMER', if_true: files('brv32p_timer.c'))
+ 
+ system_ss.add(when: 'CONFIG_AVR_TIMER16', if_true: files('avr_timer16.c'))
+diff --git a/include/hw/timer/brv32p_timer.h b/include/hw/timer/brv32p_timer.h
+new file mode 100644
+index 0000000..aabcc60
+--- /dev/null
++++ b/include/hw/timer/brv32p_timer.h
+@@ -0,0 +1,58 @@
++/*
++ * BRV32P timer
++ *
++ * Copyright (c) 2026 Brendan Lynskey
++ *
++ * Models rtl/periph/timer.v of the BRV32P SoC: a 32-bit counter behind a
++ * 32-bit prescaler, a compare register and a sticky match flag that drives
++ * the machine timer interrupt.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#ifndef HW_TIMER_BRV32P_TIMER_H
++#define HW_TIMER_BRV32P_TIMER_H
++
++#include "hw/core/sysbus.h"
++#include "qom/object.h"
++
++#define TYPE_BRV32P_TIMER "riscv.brv32p.timer"
++OBJECT_DECLARE_SIMPLE_TYPE(BRV32PTimerState, BRV32P_TIMER)
++
++/* Register window, in bytes: addr[4:2] selects the register and repeats */
++#define BRV32P_TIMER_MMIO_SIZE   0x100
++
++#define BRV32P_TIMER_CTRL        0x00   /* RW: bit 0 enable, bit 1 auto-reload */
++#define BRV32P_TIMER_PRESCALER   0x04   /* RW: a tick every prescaler + 1 cycles */
++#define BRV32P_TIMER_COMPARE     0x08   /* RW: reset 0xffffffff */
++#define BRV32P_TIMER_COUNT       0x0c   /* RW */
++#define BRV32P_TIMER_STATUS      0x10   /* R: bit 0 match flag; write 1 to clear */
++
++#define BRV32P_TIMER_CTRL_ENABLE      (1 << 0)
++#define BRV32P_TIMER_CTRL_AUTO_RELOAD (1 << 1)
++
++struct BRV32PTimerState {
++    /*< private >*/
++    SysBusDevice parent_obj;
++
++    /*< public >*/
++    MemoryRegion mmio;
++    qemu_irq irq;
++
++    /* Clock the counters run on, in Hz (property "clock-frequency") */
++    uint64_t freq;
++
++    bool enable;
++    bool auto_reload;
++    uint32_t prescaler;
++    uint32_t compare;
++    uint32_t count;
++    uint32_t pre_cnt;
++    bool match_flag;
++
++    /* The clock cycle (in virtual time) the registers above are valid at */
++    uint64_t last_cycle;
++    QEMUTimer *timer;
++};
++
++#endif /* HW_TIMER_BRV32P_TIMER_H */

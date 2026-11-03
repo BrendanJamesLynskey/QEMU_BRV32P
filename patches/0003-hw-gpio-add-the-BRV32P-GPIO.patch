@@ -1,0 +1,364 @@
+From 5eaefa14537e055c980fa91a7febb35cabd07499 Mon Sep 17 00:00:00 2001
+From: Brendan Lynskey <brendanlynskey@googlemail.com>
+Date: Tue, 3 Nov 2026 01:17:59 +0000
+Subject: [PATCH 3/6] hw/gpio: add the BRV32P GPIO
+
+A model of the 32-pin GPIO of the BRV32P SoC, with a direction register and
+a rising-edge interrupt per pin. The pins are exposed as qdev GPIO lines
+and as the QOM properties gpio-in and gpio-out.
+
+Signed-off-by: Brendan Lynskey <brendanlynskey@googlemail.com>
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/gpio/Kconfig               |   3 +
+ hw/gpio/brv32p_gpio.c         | 258 ++++++++++++++++++++++++++++++++++
+ hw/gpio/meson.build           |   1 +
+ include/hw/gpio/brv32p_gpio.h |  49 +++++++
+ 4 files changed, 311 insertions(+)
+ create mode 100644 hw/gpio/brv32p_gpio.c
+ create mode 100644 include/hw/gpio/brv32p_gpio.h
+
+diff --git a/hw/gpio/Kconfig b/hw/gpio/Kconfig
+index a209294..e68e762 100644
+--- a/hw/gpio/Kconfig
++++ b/hw/gpio/Kconfig
+@@ -13,6 +13,9 @@ config GPIO_PWR
+ config SIFIVE_GPIO
+     bool
+ 
++config BRV32P_GPIO
++    bool
++
+ config STM32L4X5_GPIO
+     bool
+ 
+diff --git a/hw/gpio/brv32p_gpio.c b/hw/gpio/brv32p_gpio.c
+new file mode 100644
+index 0000000..7f33464
+--- /dev/null
++++ b/hw/gpio/brv32p_gpio.c
+@@ -0,0 +1,258 @@
++/*
++ * BRV32P GPIO
++ *
++ * Copyright (c) 2026 Brendan Lynskey
++ *
++ * Register-exact model of rtl/periph/gpio.v. The input pins are the 32
++ * unnamed input GPIO lines of the device, and the QOM property "gpio-in"; the
++ * output pins (data_out & dir) are the 32 unnamed output lines and the
++ * read-only QOM property "gpio-out". The RTL passes the inputs through two
++ * flip-flops and a third for the edge detector, which is a delay of about 30 ns
++ * at 100 MHz and is not modelled: a pin change is seen at once.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/log.h"
++#include "qapi/error.h"
++#include "qapi/visitor.h"
++#include "hw/core/irq.h"
++#include "hw/core/qdev-properties.h"
++#include "hw/gpio/brv32p_gpio.h"
++#include "migration/vmstate.h"
++
++static void brv32p_gpio_update_out(BRV32PGPIOState *s)
++{
++    /* assign gpio_out = data_out & dir; */
++    uint32_t pins = s->data_out & s->dir;
++    uint32_t changed = pins ^ s->out_pins;
++    int i;
++
++    s->out_pins = pins;
++    for (i = 0; i < BRV32P_GPIO_NUM_PINS; i++) {
++        if (changed & (1u << i)) {
++            qemu_set_irq(s->out[i], (pins >> i) & 1);
++        }
++    }
++}
++
++static void brv32p_gpio_update_irq(BRV32PGPIOState *s)
++{
++    /* assign irq = |(irq_stat & irq_en); */
++    qemu_set_irq(s->irq, (s->irq_stat & s->irq_en) != 0);
++}
++
++static void brv32p_gpio_set_in(BRV32PGPIOState *s, uint32_t in)
++{
++    uint32_t rising = in & ~s->in;
++
++    s->in = in;
++    /* irq_stat <= irq_stat | (rising_edge & irq_en); */
++    s->irq_stat |= rising & s->irq_en;
++    brv32p_gpio_update_irq(s);
++}
++
++static void brv32p_gpio_set_pin(void *opaque, int pin, int level)
++{
++    BRV32PGPIOState *s = opaque;
++    uint32_t in = s->in & ~(1u << pin);
++
++    brv32p_gpio_set_in(s, in | ((uint32_t)!!level << pin));
++}
++
++static uint32_t brv32p_gpio_reg_read(BRV32PGPIOState *s, hwaddr reg)
++{
++    switch (reg) {
++    case BRV32P_GPIO_DATA_OUT:
++        return s->data_out;
++    case BRV32P_GPIO_DATA_IN:
++        return s->in;
++    case BRV32P_GPIO_DIR:
++        return s->dir;
++    case BRV32P_GPIO_IRQ_EN:
++        return s->irq_en;
++    case BRV32P_GPIO_IRQ_STAT:
++        return s->irq_stat;
++    default:
++        return 0;
++    }
++}
++
++static void brv32p_gpio_reg_write(BRV32PGPIOState *s, hwaddr reg, uint32_t val)
++{
++    switch (reg) {
++    case BRV32P_GPIO_DATA_OUT:
++        s->data_out = val;
++        brv32p_gpio_update_out(s);
++        break;
++    case BRV32P_GPIO_DIR:
++        s->dir = val;
++        brv32p_gpio_update_out(s);
++        break;
++    case BRV32P_GPIO_IRQ_EN:
++        s->irq_en = val;
++        break;
++    case BRV32P_GPIO_IRQ_STAT:
++        s->irq_stat &= ~val;           /* write 1 to clear */
++        break;
++    default:
++        /* DATA_IN is read-only; offsets 0x14 to 0x1c are not used */
++        break;
++    }
++    brv32p_gpio_update_irq(s);
++}
++
++/*
++ * The bridge hands the peripheral a whole 32-bit word whatever the width of
++ * the store: the D-cache replicates a byte or a halfword across the word and
++ * the bridge ignores the byte strobes. Loads take their bytes from the word.
++ */
++static uint64_t brv32p_gpio_read(void *opaque, hwaddr addr, unsigned size)
++{
++    BRV32PGPIOState *s = opaque;
++    uint32_t word = brv32p_gpio_reg_read(s, addr & 0x1c);
++
++    return (word >> ((addr & 3) * 8)) & MAKE_64BIT_MASK(0, size * 8);
++}
++
++static void brv32p_gpio_write(void *opaque, hwaddr addr, uint64_t val,
++                              unsigned size)
++{
++    BRV32PGPIOState *s = opaque;
++    uint32_t word;
++
++    switch (size) {
++    case 1:
++        word = (val & 0xff) * 0x01010101u;
++        break;
++    case 2:
++        word = (val & 0xffff) * 0x00010001u;
++        break;
++    default:
++        word = val;
++        break;
++    }
++    brv32p_gpio_reg_write(s, addr & 0x1c, word);
++}
++
++static const MemoryRegionOps brv32p_gpio_ops = {
++    .read = brv32p_gpio_read,
++    .write = brv32p_gpio_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = {
++        .min_access_size = 1,
++        .max_access_size = 4,
++    },
++    .impl = {
++        .min_access_size = 1,
++        .max_access_size = 4,
++    },
++};
++
++static void brv32p_gpio_get_in(Object *obj, Visitor *v, const char *name,
++                               void *opaque, Error **errp)
++{
++    BRV32PGPIOState *s = BRV32P_GPIO(obj);
++
++    visit_type_uint32(v, name, &s->in, errp);
++}
++
++static void brv32p_gpio_set_in_prop(Object *obj, Visitor *v, const char *name,
++                                    void *opaque, Error **errp)
++{
++    BRV32PGPIOState *s = BRV32P_GPIO(obj);
++    uint32_t in;
++
++    if (!visit_type_uint32(v, name, &in, errp)) {
++        return;
++    }
++    brv32p_gpio_set_in(s, in);
++}
++
++static void brv32p_gpio_reset_enter(Object *obj, ResetType type)
++{
++    BRV32PGPIOState *s = BRV32P_GPIO(obj);
++
++    /*
++     * The pins keep their level over a reset (the RTL's synchroniser is
++     * cleared, but follows the pins again at once), so s->in is not touched.
++     */
++    s->data_out = 0;
++    s->dir = 0;
++    s->irq_en = 0;
++    s->irq_stat = 0;
++    s->out_pins = 0;
++}
++
++static void brv32p_gpio_reset_hold(Object *obj, ResetType type)
++{
++    BRV32PGPIOState *s = BRV32P_GPIO(obj);
++    int i;
++
++    qemu_irq_lower(s->irq);
++    for (i = 0; i < BRV32P_GPIO_NUM_PINS; i++) {
++        qemu_irq_lower(s->out[i]);
++    }
++}
++
++static void brv32p_gpio_init(Object *obj)
++{
++    SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
++    DeviceState *dev = DEVICE(obj);
++    BRV32PGPIOState *s = BRV32P_GPIO(obj);
++
++    memory_region_init_io(&s->mmio, obj, &brv32p_gpio_ops, s,
++                          TYPE_BRV32P_GPIO, BRV32P_GPIO_MMIO_SIZE);
++    sysbus_init_mmio(sbd, &s->mmio);
++    sysbus_init_irq(sbd, &s->irq);
++
++    qdev_init_gpio_in(dev, brv32p_gpio_set_pin, BRV32P_GPIO_NUM_PINS);
++    qdev_init_gpio_out(dev, s->out, BRV32P_GPIO_NUM_PINS);
++
++    object_property_add(obj, "gpio-in", "uint32", brv32p_gpio_get_in,
++                        brv32p_gpio_set_in_prop, NULL, NULL);
++    object_property_add_uint32_ptr(obj, "gpio-out", &s->out_pins,
++                                   OBJ_PROP_FLAG_READ);
++}
++
++static const VMStateDescription vmstate_brv32p_gpio = {
++    .name = TYPE_BRV32P_GPIO,
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT32(data_out, BRV32PGPIOState),
++        VMSTATE_UINT32(dir, BRV32PGPIOState),
++        VMSTATE_UINT32(irq_en, BRV32PGPIOState),
++        VMSTATE_UINT32(irq_stat, BRV32PGPIOState),
++        VMSTATE_UINT32(in, BRV32PGPIOState),
++        VMSTATE_UINT32(out_pins, BRV32PGPIOState),
++        VMSTATE_END_OF_LIST()
++    },
++};
++
++static void brv32p_gpio_class_init(ObjectClass *oc, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(oc);
++    ResettableClass *rc = RESETTABLE_CLASS(oc);
++
++    dc->vmsd = &vmstate_brv32p_gpio;
++    rc->phases.enter = brv32p_gpio_reset_enter;
++    rc->phases.hold = brv32p_gpio_reset_hold;
++    set_bit(DEVICE_CATEGORY_INPUT, dc->categories);
++}
++
++static const TypeInfo brv32p_gpio_info = {
++    .name          = TYPE_BRV32P_GPIO,
++    .parent        = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(BRV32PGPIOState),
++    .instance_init = brv32p_gpio_init,
++    .class_init    = brv32p_gpio_class_init,
++};
++
++static void brv32p_gpio_register_types(void)
++{
++    type_register_static(&brv32p_gpio_info);
++}
++
++type_init(brv32p_gpio_register_types)
+diff --git a/hw/gpio/meson.build b/hw/gpio/meson.build
+index 6a67ee9..9e57238 100644
+--- a/hw/gpio/meson.build
++++ b/hw/gpio/meson.build
+@@ -18,4 +18,5 @@ system_ss.add(when: 'CONFIG_STM32L4X5_SOC', if_true: files('stm32l4x5_gpio.c'))
+ system_ss.add(when: 'CONFIG_ASPEED_SOC', if_true: files('aspeed_gpio.c'))
+ system_ss.add(when: 'CONFIG_ASPEED_SOC', if_true: files('aspeed_sgpio.c'))
+ system_ss.add(when: 'CONFIG_SIFIVE_GPIO', if_true: files('sifive_gpio.c'))
++system_ss.add(when: 'CONFIG_BRV32P_GPIO', if_true: files('brv32p_gpio.c'))
+ system_ss.add(when: 'CONFIG_PCF8574', if_true: files('pcf8574.c'))
+diff --git a/include/hw/gpio/brv32p_gpio.h b/include/hw/gpio/brv32p_gpio.h
+new file mode 100644
+index 0000000..6cc6279
+--- /dev/null
++++ b/include/hw/gpio/brv32p_gpio.h
+@@ -0,0 +1,49 @@
++/*
++ * BRV32P GPIO
++ *
++ * Copyright (c) 2026 Brendan Lynskey
++ *
++ * Models rtl/periph/gpio.v of the BRV32P SoC: 32 pins with a direction
++ * register and a rising-edge interrupt per pin.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#ifndef HW_GPIO_BRV32P_GPIO_H
++#define HW_GPIO_BRV32P_GPIO_H
++
++#include "hw/core/sysbus.h"
++#include "qom/object.h"
++
++#define TYPE_BRV32P_GPIO "riscv.brv32p.gpio"
++OBJECT_DECLARE_SIMPLE_TYPE(BRV32PGPIOState, BRV32P_GPIO)
++
++#define BRV32P_GPIO_NUM_PINS    32
++
++/* Register window, in bytes: addr[4:2] selects the register and repeats */
++#define BRV32P_GPIO_MMIO_SIZE   0x100
++
++#define BRV32P_GPIO_DATA_OUT    0x00   /* RW */
++#define BRV32P_GPIO_DATA_IN     0x04   /* R: the synchronised pins */
++#define BRV32P_GPIO_DIR         0x08   /* RW: 1 = output */
++#define BRV32P_GPIO_IRQ_EN      0x0c   /* RW */
++#define BRV32P_GPIO_IRQ_STAT    0x10   /* R, write 1 to clear */
++
++struct BRV32PGPIOState {
++    /*< private >*/
++    SysBusDevice parent_obj;
++
++    /*< public >*/
++    MemoryRegion mmio;
++    qemu_irq irq;
++    qemu_irq out[BRV32P_GPIO_NUM_PINS];
++
++    uint32_t data_out;
++    uint32_t dir;
++    uint32_t irq_en;
++    uint32_t irq_stat;
++    uint32_t in;         /* the pin levels as the register sees them */
++    uint32_t out_pins;   /* data_out & dir, as last driven */
++};
++
++#endif /* HW_GPIO_BRV32P_GPIO_H */

@@ -1,0 +1,347 @@
+From 806d64b8842dfcd1abe6aac112fcfead09c722b5 Mon Sep 17 00:00:00 2001
+From: Brendan Lynskey <brendanlynskey@googlemail.com>
+Date: Tue, 3 Nov 2026 01:17:59 +0000
+Subject: [PATCH 5/6] hw/riscv: add the BRV32P SoC machine
+
+A machine that models the BRV32P SoC: one RV32IMC hart in machine mode, a
+32 KB SRAM, and the GPIO, UART and timer at 0x20000000, 0x20000100 and
+0x20000200. There is no PLIC: the GPIO and UART interrupts are ORed into the
+machine external interrupt and the timer drives the machine timer interrupt.
+
+An ELF given with -kernel is loaded where it is linked and started at its
+entry point, and a store to its tohost symbol ends the run with the
+riscv-tests exit code.
+
+Signed-off-by: Brendan Lynskey <brendanlynskey@googlemail.com>
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/riscv/Kconfig          |   9 ++
+ hw/riscv/brv32p.c         | 225 ++++++++++++++++++++++++++++++++++++++
+ hw/riscv/meson.build      |   1 +
+ include/hw/riscv/brv32p.h |  52 +++++++++
+ 4 files changed, 287 insertions(+)
+ create mode 100644 hw/riscv/brv32p.c
+ create mode 100644 include/hw/riscv/brv32p.h
+
+diff --git a/hw/riscv/Kconfig b/hw/riscv/Kconfig
+index de37c08..1244208 100644
+--- a/hw/riscv/Kconfig
++++ b/hw/riscv/Kconfig
+@@ -110,6 +110,15 @@ config SIFIVE_U
+     select SSI_SD
+     select UNIMP
+ 
++config BRV32P
++    bool
++    default y
++    depends on RISCV32
++    select BRV32P_GPIO
++    select BRV32P_TIMER
++    select BRV32P_UART
++    select OR_IRQ
++
+ config SPIKE
+     bool
+     default y
+diff --git a/hw/riscv/brv32p.c b/hw/riscv/brv32p.c
+new file mode 100644
+index 0000000..69e52d4
+--- /dev/null
++++ b/hw/riscv/brv32p.c
+@@ -0,0 +1,225 @@
++/*
++ * BRV32P SoC machine
++ *
++ * Copyright (c) 2026 Brendan Lynskey
++ *
++ * A model of the BRV32P SoC (an RV32IMC core in machine mode with a 32 KB
++ * SRAM, a GPIO, a UART and a timer) for running the same binaries as the RTL.
++ * There is no PLIC: the GPIO and UART interrupts are ORed into the machine
++ * external interrupt, and the timer drives the machine timer interrupt.
++ *
++ * The memory map is that of the RTL, in which every address that is not in
++ * the peripheral window (addr[31:28] == 2) aliases the 32 KB SRAM. Two of
++ * those aliases are mapped: 0x00000000, the default reset address, and
++ * 0x80000000, where the riscv-tests are linked (as for Spike's RAM).
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/error-report.h"
++#include "qapi/error.h"
++#include "hw/core/boards.h"
++#include "hw/core/loader.h"
++#include "hw/core/qdev-properties.h"
++#include "hw/core/qdev-properties-system.h"
++#include "hw/core/sysbus.h"
++#include "hw/riscv/brv32p.h"
++#include "hw/riscv/machines-qom.h"
++#include "system/runstate.h"
++#include "system/system.h"
++#include "target/riscv/cpu.h"
++#include "elf.h"
++
++static const MemMapEntry brv32p_memmap[] = {
++    [BRV32P_DEV_SRAM] =       { 0x00000000, 0x8000 },
++    [BRV32P_DEV_SRAM_ALIAS] = { 0x80000000, 0x8000 },
++    [BRV32P_DEV_GPIO] =       { 0x20000000, 0x100 },
++    [BRV32P_DEV_UART] =       { 0x20000100, 0x100 },
++    [BRV32P_DEV_TIMER] =      { 0x20000200, 0x100 },
++};
++
++/* Where the ELF loader finds "tohost"; 0 if the image has no such symbol */
++static uint64_t brv32p_tohost_addr;
++
++static void brv32p_symbol_callback(const char *st_name, int st_info,
++                                   uint64_t st_value, uint64_t st_size)
++{
++    if (strcmp(st_name, "tohost") == 0) {
++        brv32p_tohost_addr = st_value;
++    }
++}
++
++/*
++ * The riscv-tests report their result with a store to "tohost": 1 for a
++ * pass, or (test number << 1) | 1 for a failure. In the RTL it is a word of
++ * the SRAM that the testbench watches. This is the same exit convention as
++ * the HTIF of -M spike, taken from the first 32-bit store: the HTIF of RV32
++ * acts only when the upper word is written as well, and the tests built for
++ * the core store the lower word alone.
++ */
++static uint64_t brv32p_tohost_read(void *opaque, hwaddr addr, unsigned size)
++{
++    BRV32PToHost *t = opaque;
++
++    return addr == 0 ? t->value : 0;
++}
++
++static void brv32p_tohost_write(void *opaque, hwaddr addr, uint64_t val,
++                                unsigned size)
++{
++    BRV32PToHost *t = opaque;
++
++    if (addr != 0) {
++        return;                 /* the upper word is not used */
++    }
++    t->value = val;
++    if (val & 1) {
++        qemu_system_shutdown_request_with_code(SHUTDOWN_CAUSE_GUEST_SHUTDOWN,
++                                               val >> 1);
++    }
++}
++
++static const MemoryRegionOps brv32p_tohost_ops = {
++    .read = brv32p_tohost_read,
++    .write = brv32p_tohost_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .impl = {
++        .min_access_size = 4,
++        .max_access_size = 4,
++    },
++    .valid = {
++        .min_access_size = 4,
++        .max_access_size = 4,
++    },
++};
++
++static void brv32p_machine_init(MachineState *machine)
++{
++    MachineClass *mc = MACHINE_GET_CLASS(machine);
++    BRV32PState *s = BRV32P_MACHINE(machine);
++    MemoryRegion *sys_mem = get_system_memory();
++    const MemMapEntry *memmap = brv32p_memmap;
++    DeviceState *cpu_dev;
++    uint64_t reset_pc = 0;
++    int i;
++
++    if (machine->ram_size != mc->default_ram_size) {
++        error_report("Invalid RAM size, should be 32 KiB");
++        exit(EXIT_FAILURE);
++    }
++
++    /* The SRAM and its alias where the riscv-tests are linked */
++    memory_region_add_subregion(sys_mem, memmap[BRV32P_DEV_SRAM].base,
++                                machine->ram);
++    memory_region_init_alias(&s->sram_alias, OBJECT(machine),
++                             "riscv.brv32p.sram.alias", machine->ram, 0,
++                             memmap[BRV32P_DEV_SRAM_ALIAS].size);
++    memory_region_add_subregion(sys_mem, memmap[BRV32P_DEV_SRAM_ALIAS].base,
++                                &s->sram_alias);
++
++    /* The image: an ELF is loaded where it is linked and started at its entry */
++    if (machine->kernel_filename) {
++        uint64_t entry;
++        ssize_t size = load_elf_ram_sym(machine->kernel_filename, NULL, NULL,
++                                        NULL, &entry, NULL, NULL, NULL,
++                                        ELFDATA2LSB, EM_RISCV, 1, 0, NULL,
++                                        true, brv32p_symbol_callback);
++        if (size < 0) {
++            error_report("could not load ELF '%s'", machine->kernel_filename);
++            exit(EXIT_FAILURE);
++        }
++        reset_pc = (uint32_t)entry;
++    }
++
++    if (brv32p_tohost_addr) {
++        memory_region_init_io(&s->tohost.mmio, OBJECT(machine),
++                              &brv32p_tohost_ops, &s->tohost, "riscv.brv32p.tohost",
++                              4);
++        memory_region_add_subregion_overlap(sys_mem, brv32p_tohost_addr,
++                                            &s->tohost.mmio, 1);
++    }
++
++    /* The hart; the reset address is the RTL's RESET_PC parameter */
++    object_initialize_child(OBJECT(machine), "soc", &s->soc,
++                            TYPE_RISCV_HART_ARRAY);
++    object_property_set_str(OBJECT(&s->soc), "cpu-type", machine->cpu_type,
++                            &error_abort);
++    object_property_set_int(OBJECT(&s->soc), "num-harts", 1, &error_abort);
++    object_property_set_int(OBJECT(&s->soc), "resetvec", reset_pc,
++                            &error_abort);
++    sysbus_realize(SYS_BUS_DEVICE(&s->soc), &error_fatal);
++    cpu_dev = DEVICE(&s->soc.harts[0]);
++
++    /* The external interrupt is gpio_irq | uart_irq; there is no PLIC */
++    object_initialize_child(OBJECT(machine), "ext-irq", &s->ext_irq,
++                            TYPE_OR_IRQ);
++    qdev_prop_set_uint16(DEVICE(&s->ext_irq), "num-lines", 2);
++    qdev_realize(DEVICE(&s->ext_irq), NULL, &error_fatal);
++    qdev_connect_gpio_out(DEVICE(&s->ext_irq), 0,
++                          qdev_get_gpio_in(cpu_dev, IRQ_M_EXT));
++
++    /* The peripherals, at the offsets of the peripheral bridge */
++    object_initialize_child(OBJECT(machine), "gpio", &s->gpio,
++                            TYPE_BRV32P_GPIO);
++    sysbus_realize(SYS_BUS_DEVICE(&s->gpio), &error_fatal);
++    sysbus_mmio_map(SYS_BUS_DEVICE(&s->gpio), 0, memmap[BRV32P_DEV_GPIO].base);
++    sysbus_connect_irq(SYS_BUS_DEVICE(&s->gpio), 0,
++                       qdev_get_gpio_in(DEVICE(&s->ext_irq), 0));
++
++    /*
++     * The bridge selects a device by addr[11:8] and sends the unused values
++     * (3 to 15) to the GPIO, so the GPIO is also at 0x300 to 0xfff
++     */
++    for (i = 0; i < ARRAY_SIZE(s->gpio_alias); i++) {
++        memory_region_init_alias(&s->gpio_alias[i], OBJECT(machine),
++                                 "riscv.brv32p.gpio.alias",
++                                 sysbus_mmio_get_region(SYS_BUS_DEVICE(&s->gpio),
++                                                        0),
++                                 0, memmap[BRV32P_DEV_GPIO].size);
++        memory_region_add_subregion(sys_mem,
++                                    memmap[BRV32P_DEV_GPIO].base + (i + 3) * 0x100,
++                                    &s->gpio_alias[i]);
++    }
++
++    object_initialize_child(OBJECT(machine), "uart", &s->uart,
++                            TYPE_BRV32P_UART);
++    if (serial_hd(0)) {
++        qdev_prop_set_chr(DEVICE(&s->uart), "chardev", serial_hd(0));
++    }
++    sysbus_realize(SYS_BUS_DEVICE(&s->uart), &error_fatal);
++    sysbus_mmio_map(SYS_BUS_DEVICE(&s->uart), 0, memmap[BRV32P_DEV_UART].base);
++    sysbus_connect_irq(SYS_BUS_DEVICE(&s->uart), 0,
++                       qdev_get_gpio_in(DEVICE(&s->ext_irq), 1));
++
++    object_initialize_child(OBJECT(machine), "timer", &s->timer,
++                            TYPE_BRV32P_TIMER);
++    sysbus_realize(SYS_BUS_DEVICE(&s->timer), &error_fatal);
++    sysbus_mmio_map(SYS_BUS_DEVICE(&s->timer), 0, memmap[BRV32P_DEV_TIMER].base);
++    sysbus_connect_irq(SYS_BUS_DEVICE(&s->timer), 0,
++                       qdev_get_gpio_in(cpu_dev, IRQ_M_TIMER));
++}
++
++static void brv32p_machine_class_init(ObjectClass *oc, const void *data)
++{
++    MachineClass *mc = MACHINE_CLASS(oc);
++
++    mc->desc = "RISC-V BRV32P SoC (RV32IMC, SRAM, GPIO, UART, timer)";
++    mc->init = brv32p_machine_init;
++    mc->max_cpus = 1;
++    mc->default_cpu_type = TYPE_RISCV_CPU_BRV32P;
++    mc->default_ram_id = "riscv.brv32p.sram";
++    mc->default_ram_size = brv32p_memmap[BRV32P_DEV_SRAM].size;
++}
++
++static const TypeInfo brv32p_machine_types[] = {
++    {
++        .name           = TYPE_BRV32P_MACHINE,
++        .parent         = TYPE_MACHINE,
++        .instance_size  = sizeof(BRV32PState),
++        .class_init     = brv32p_machine_class_init,
++        .interfaces     = riscv32_machine_interfaces,
++    }
++};
++
++DEFINE_TYPES(brv32p_machine_types)
+diff --git a/hw/riscv/meson.build b/hw/riscv/meson.build
+index 0d82cea..236cf04 100644
+--- a/hw/riscv/meson.build
++++ b/hw/riscv/meson.build
+@@ -4,6 +4,7 @@ riscv_ss.add(files('boot.c'))
+ riscv_ss.add(files('fdt-common.c'))
+ riscv_ss.add(when: 'CONFIG_RISCV_NUMA', if_true: files('numa.c'))
+ riscv_ss.add(files('riscv_hart.c'))
++riscv_ss.add(when: 'CONFIG_BRV32P', if_true: files('brv32p.c'))
+ riscv_ss.add(when: 'CONFIG_OPENTITAN', if_true: files('opentitan.c'))
+ riscv_ss.add(when: 'CONFIG_RISCV_VIRT', if_true: files('virt.c'))
+ riscv_ss.add(when: 'CONFIG_SHAKTI_C', if_true: files('shakti_c.c'))
+diff --git a/include/hw/riscv/brv32p.h b/include/hw/riscv/brv32p.h
+new file mode 100644
+index 0000000..6f16213
+--- /dev/null
++++ b/include/hw/riscv/brv32p.h
+@@ -0,0 +1,52 @@
++/*
++ * BRV32P SoC machine
++ *
++ * Copyright (c) 2026 Brendan Lynskey
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#ifndef HW_RISCV_BRV32P_H
++#define HW_RISCV_BRV32P_H
++
++#include "hw/core/boards.h"
++#include "hw/core/or-irq.h"
++#include "hw/char/brv32p_uart.h"
++#include "hw/gpio/brv32p_gpio.h"
++#include "hw/riscv/riscv_hart.h"
++#include "hw/timer/brv32p_timer.h"
++
++#define TYPE_BRV32P_MACHINE MACHINE_TYPE_NAME("brv32p")
++typedef struct BRV32PState BRV32PState;
++DECLARE_INSTANCE_CHECKER(BRV32PState, BRV32P_MACHINE, TYPE_BRV32P_MACHINE)
++
++/* The "tohost" word of the riscv-tests convention, watched for the exit code */
++typedef struct BRV32PToHost {
++    MemoryRegion mmio;
++    uint32_t value;
++} BRV32PToHost;
++
++struct BRV32PState {
++    /*< private >*/
++    MachineState parent_obj;
++
++    /*< public >*/
++    RISCVHartArrayState soc;
++    MemoryRegion sram_alias;
++    MemoryRegion gpio_alias[13];
++    BRV32PGPIOState gpio;
++    BRV32PUARTState uart;
++    BRV32PTimerState timer;
++    OrIRQState ext_irq;
++    BRV32PToHost tohost;
++};
++
++enum {
++    BRV32P_DEV_SRAM,
++    BRV32P_DEV_SRAM_ALIAS,
++    BRV32P_DEV_GPIO,
++    BRV32P_DEV_UART,
++    BRV32P_DEV_TIMER,
++};
++
++#endif /* HW_RISCV_BRV32P_H */

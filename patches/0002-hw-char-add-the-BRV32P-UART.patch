@@ -1,0 +1,416 @@
+From 201f385a8bfc5533a217e97c19d1b535be07057a Mon Sep 17 00:00:00 2001
+From: Brendan Lynskey <brendanlynskey@googlemail.com>
+Date: Tue, 3 Nov 2026 01:17:59 +0000
+Subject: [PATCH 2/6] hw/char: add the BRV32P UART
+
+A model of the UART of the BRV32P SoC (8N1, 16-bit clock divider,
+interrupt on receive-data-valid), register-exact to the RTL, including the
+transmit and receive frame times and the single-word bus accesses of the
+peripheral bridge.
+
+Signed-off-by: Brendan Lynskey <brendanlynskey@googlemail.com>
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/char/Kconfig               |   3 +
+ hw/char/brv32p_uart.c         | 295 ++++++++++++++++++++++++++++++++++
+ hw/char/meson.build           |   1 +
+ include/hw/char/brv32p_uart.h |  61 +++++++
+ 4 files changed, 360 insertions(+)
+ create mode 100644 hw/char/brv32p_uart.c
+ create mode 100644 include/hw/char/brv32p_uart.h
+
+diff --git a/hw/char/Kconfig b/hw/char/Kconfig
+index 020c0a8..47dbaae 100644
+--- a/hw/char/Kconfig
++++ b/hw/char/Kconfig
+@@ -85,6 +85,9 @@ config MCHP_PFSOC_MMUART
+ config SIFIVE_UART
+     bool
+ 
++config BRV32P_UART
++    bool
++
+ config GOLDFISH_TTY
+     bool
+ 
+diff --git a/hw/char/brv32p_uart.c b/hw/char/brv32p_uart.c
+new file mode 100644
+index 0000000..3b56381
+--- /dev/null
++++ b/hw/char/brv32p_uart.c
+@@ -0,0 +1,295 @@
++/*
++ * BRV32P UART
++ *
++ * Copyright (c) 2026 Brendan Lynskey
++ *
++ * Register-exact model of rtl/periph/uart.v. The bit timing is kept: a
++ * transmission holds tx_busy for 1 + 10 * (clk_div + 1) clock cycles after
++ * the write, and a received frame becomes visible after 10 * (clk_div + 1)
++ * cycles. Cycles are counted in virtual time at "clock-frequency".
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "qapi/error.h"
++#include "qemu/log.h"
++#include "qemu/host-utils.h"
++#include "qemu/timer.h"
++#include "migration/vmstate.h"
++#include "chardev/char.h"
++#include "chardev/char-fe.h"
++#include "hw/core/irq.h"
++#include "hw/core/qdev-properties.h"
++#include "hw/core/qdev-properties-system.h"
++#include "hw/char/brv32p_uart.h"
++
++#define BRV32P_CLOCK_FREQ_DEFAULT 100000000   /* the 100 MHz the RTL targets */
++
++static int64_t brv32p_uart_cycles_to_ns(BRV32PUARTState *s, uint64_t cycles)
++{
++    /* Round up, so that the state has changed by the time the timer fires */
++    return muldiv64(cycles, NANOSECONDS_PER_SECOND, s->freq) + 1;
++}
++
++static void brv32p_uart_update_irq(BRV32PUARTState *s)
++{
++    /* assign irq = rx_valid; */
++    qemu_set_irq(s->irq, s->rx_valid);
++}
++
++static void brv32p_uart_tx_done(void *opaque)
++{
++    BRV32PUARTState *s = opaque;
++
++    s->tx_busy = false;
++}
++
++static void brv32p_uart_rx_done(void *opaque)
++{
++    BRV32PUARTState *s = opaque;
++
++    /* RX_STOP: a second frame before the first is read sets the overrun flag */
++    if (s->rx_valid) {
++        s->rx_overrun = true;
++    }
++    s->rx_data = s->rx_shift;
++    s->rx_valid = true;
++    s->rx_busy = false;
++    brv32p_uart_update_irq(s);
++    qemu_chr_fe_accept_input(&s->chr);
++}
++
++static int brv32p_uart_can_rx(void *opaque)
++{
++    BRV32PUARTState *s = opaque;
++
++    /* The receiver takes one frame at a time */
++    return !s->rx_busy;
++}
++
++static void brv32p_uart_rx(void *opaque, const uint8_t *buf, int size)
++{
++    BRV32PUARTState *s = opaque;
++
++    if (size < 1 || s->rx_busy) {
++        return;
++    }
++    s->rx_busy = true;
++    s->rx_shift = buf[0];
++    timer_mod(s->rx_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
++              brv32p_uart_cycles_to_ns(s, 10 * ((uint64_t)s->clk_div + 1)));
++}
++
++static void brv32p_uart_event(void *opaque, QEMUChrEvent event)
++{
++}
++
++static uint32_t brv32p_uart_reg_read(BRV32PUARTState *s, hwaddr reg)
++{
++    uint32_t r;
++
++    switch (reg) {
++    case BRV32P_UART_TXDATA:
++        return 0;
++    case BRV32P_UART_RXDATA:
++        r = s->rx_data;
++        /* if (rd_en && addr[3:2] == 1) rx_valid <= 0; */
++        s->rx_valid = false;
++        brv32p_uart_update_irq(s);
++        return r;
++    case BRV32P_UART_STATUS:
++        return (s->rx_overrun << 2) | (s->rx_valid << 1) | s->tx_busy;
++    case BRV32P_UART_CLKDIV:
++        return s->clk_div;
++    default:
++        g_assert_not_reached();
++    }
++}
++
++static void brv32p_uart_reg_write(BRV32PUARTState *s, hwaddr reg,
++                                  uint32_t val)
++{
++    uint8_t ch;
++
++    switch (reg) {
++    case BRV32P_UART_TXDATA:
++        /* A write is taken only while the transmitter is idle */
++        if (s->tx_busy) {
++            qemu_log_mask(LOG_GUEST_ERROR,
++                          "brv32p_uart: write to TXDATA while busy, dropped\n");
++            return;
++        }
++        s->tx_busy = true;
++        ch = val & 0xff;
++        if (qemu_chr_fe_backend_connected(&s->chr)) {
++            /* One byte: blocking here is what the other simple UARTs do */
++            qemu_chr_fe_write_all(&s->chr, &ch, 1);
++        }
++        timer_mod(s->tx_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
++                  brv32p_uart_cycles_to_ns(s,
++                                           1 + 10 * ((uint64_t)s->clk_div + 1)));
++        break;
++    case BRV32P_UART_CLKDIV:
++        s->clk_div = val & 0xffff;
++        break;
++    default:
++        /* RXDATA and STATUS are read-only; the write has no effect */
++        break;
++    }
++}
++
++/*
++ * The bridge hands the peripheral a whole 32-bit word whatever the width of
++ * the store: the D-cache replicates a byte or a halfword across the word and
++ * the bridge ignores the byte strobes. Loads take their bytes from the word.
++ */
++static uint64_t brv32p_uart_read(void *opaque, hwaddr addr, unsigned size)
++{
++    BRV32PUARTState *s = opaque;
++    uint32_t word = brv32p_uart_reg_read(s, addr & 0xc);
++
++    return (word >> ((addr & 3) * 8)) & MAKE_64BIT_MASK(0, size * 8);
++}
++
++static void brv32p_uart_write(void *opaque, hwaddr addr, uint64_t val,
++                              unsigned size)
++{
++    BRV32PUARTState *s = opaque;
++    uint32_t word;
++
++    switch (size) {
++    case 1:
++        word = (val & 0xff) * 0x01010101u;
++        break;
++    case 2:
++        word = (val & 0xffff) * 0x00010001u;
++        break;
++    default:
++        word = val;
++        break;
++    }
++    brv32p_uart_reg_write(s, addr & 0xc, word);
++}
++
++static const MemoryRegionOps brv32p_uart_ops = {
++    .read = brv32p_uart_read,
++    .write = brv32p_uart_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = {
++        .min_access_size = 1,
++        .max_access_size = 4,
++    },
++    .impl = {
++        .min_access_size = 1,
++        .max_access_size = 4,
++    },
++};
++
++static void brv32p_uart_reset_enter(Object *obj, ResetType type)
++{
++    BRV32PUARTState *s = BRV32P_UART(obj);
++
++    s->clk_div = BRV32P_UART_CLKDIV_RESET;
++    s->tx_busy = false;
++    s->rx_busy = false;
++    s->rx_valid = false;
++    s->rx_overrun = false;
++    s->rx_data = 0;
++    s->rx_shift = 0;
++    timer_del(s->tx_timer);
++    timer_del(s->rx_timer);
++}
++
++static void brv32p_uart_reset_hold(Object *obj, ResetType type)
++{
++    BRV32PUARTState *s = BRV32P_UART(obj);
++
++    qemu_irq_lower(s->irq);
++}
++
++static void brv32p_uart_realize(DeviceState *dev, Error **errp)
++{
++    BRV32PUARTState *s = BRV32P_UART(dev);
++
++    if (!s->freq) {
++        error_setg(errp, "brv32p-uart: clock-frequency must not be zero");
++        return;
++    }
++    s->tx_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, brv32p_uart_tx_done, s);
++    s->rx_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, brv32p_uart_rx_done, s);
++    qemu_chr_fe_set_handlers(&s->chr, brv32p_uart_can_rx, brv32p_uart_rx,
++                             brv32p_uart_event, NULL, s, NULL, true);
++}
++
++static void brv32p_uart_unrealize(DeviceState *dev)
++{
++    BRV32PUARTState *s = BRV32P_UART(dev);
++
++    timer_free(s->tx_timer);
++    timer_free(s->rx_timer);
++}
++
++static void brv32p_uart_init(Object *obj)
++{
++    SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
++    BRV32PUARTState *s = BRV32P_UART(obj);
++
++    memory_region_init_io(&s->mmio, obj, &brv32p_uart_ops, s,
++                          TYPE_BRV32P_UART, BRV32P_UART_MMIO_SIZE);
++    sysbus_init_mmio(sbd, &s->mmio);
++    sysbus_init_irq(sbd, &s->irq);
++}
++
++static const Property brv32p_uart_properties[] = {
++    DEFINE_PROP_CHR("chardev", BRV32PUARTState, chr),
++    DEFINE_PROP_UINT64("clock-frequency", BRV32PUARTState, freq,
++                       BRV32P_CLOCK_FREQ_DEFAULT),
++};
++
++static const VMStateDescription vmstate_brv32p_uart = {
++    .name = TYPE_BRV32P_UART,
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT16(clk_div, BRV32PUARTState),
++        VMSTATE_BOOL(tx_busy, BRV32PUARTState),
++        VMSTATE_BOOL(rx_busy, BRV32PUARTState),
++        VMSTATE_BOOL(rx_valid, BRV32PUARTState),
++        VMSTATE_BOOL(rx_overrun, BRV32PUARTState),
++        VMSTATE_UINT8(rx_data, BRV32PUARTState),
++        VMSTATE_UINT8(rx_shift, BRV32PUARTState),
++        VMSTATE_TIMER_PTR(tx_timer, BRV32PUARTState),
++        VMSTATE_TIMER_PTR(rx_timer, BRV32PUARTState),
++        VMSTATE_END_OF_LIST()
++    },
++};
++
++static void brv32p_uart_class_init(ObjectClass *oc, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(oc);
++    ResettableClass *rc = RESETTABLE_CLASS(oc);
++
++    dc->realize = brv32p_uart_realize;
++    dc->unrealize = brv32p_uart_unrealize;
++    dc->vmsd = &vmstate_brv32p_uart;
++    rc->phases.enter = brv32p_uart_reset_enter;
++    rc->phases.hold = brv32p_uart_reset_hold;
++    device_class_set_props(dc, brv32p_uart_properties);
++    set_bit(DEVICE_CATEGORY_INPUT, dc->categories);
++}
++
++static const TypeInfo brv32p_uart_info = {
++    .name          = TYPE_BRV32P_UART,
++    .parent        = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(BRV32PUARTState),
++    .instance_init = brv32p_uart_init,
++    .class_init    = brv32p_uart_class_init,
++};
++
++static void brv32p_uart_register_types(void)
++{
++    type_register_static(&brv32p_uart_info);
++}
++
++type_init(brv32p_uart_register_types)
+diff --git a/hw/char/meson.build b/hw/char/meson.build
+index fc3d7ee..457347e 100644
+--- a/hw/char/meson.build
++++ b/hw/char/meson.build
+@@ -32,6 +32,7 @@ system_ss.add(when: 'CONFIG_OMAP', if_true: files('omap_uart.c'))
+ system_ss.add(when: 'CONFIG_RASPI', if_true: files('bcm2835_aux.c'))
+ system_ss.add(when: 'CONFIG_RENESAS_SCI', if_true: files('renesas_sci.c'))
+ system_ss.add(when: 'CONFIG_SIFIVE_UART', if_true: files('sifive_uart.c'))
++system_ss.add(when: 'CONFIG_BRV32P_UART', if_true: files('brv32p_uart.c'))
+ system_ss.add(when: 'CONFIG_SH_SCI', if_true: files('sh_serial.c'))
+ system_ss.add(when: 'CONFIG_STM32F2XX_USART', if_true: files('stm32f2xx_usart.c'))
+ system_ss.add(when: 'CONFIG_STM32L4X5_USART', if_true: files('stm32l4x5_usart.c'))
+diff --git a/include/hw/char/brv32p_uart.h b/include/hw/char/brv32p_uart.h
+new file mode 100644
+index 0000000..7d4723b
+--- /dev/null
++++ b/include/hw/char/brv32p_uart.h
+@@ -0,0 +1,61 @@
++/*
++ * BRV32P UART
++ *
++ * Copyright (c) 2026 Brendan Lynskey
++ *
++ * Models rtl/periph/uart.v of the BRV32P SoC: a transmit and a receive path,
++ * 8N1, a 16-bit clock divider, and an interrupt that follows "receive data
++ * valid".
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#ifndef HW_CHAR_BRV32P_UART_H
++#define HW_CHAR_BRV32P_UART_H
++
++#include "chardev/char-fe.h"
++#include "hw/core/sysbus.h"
++#include "qom/object.h"
++
++#define TYPE_BRV32P_UART "riscv.brv32p.uart"
++OBJECT_DECLARE_SIMPLE_TYPE(BRV32PUARTState, BRV32P_UART)
++
++/* Register window, in bytes: addr[3:2] selects the register and repeats */
++#define BRV32P_UART_MMIO_SIZE    0x100
++
++#define BRV32P_UART_TXDATA       0x0   /* W: start a transmission */
++#define BRV32P_UART_RXDATA       0x4   /* R: received byte; the read clears rx_valid */
++#define BRV32P_UART_STATUS       0x8   /* R: {overrun, rx_valid, tx_busy} */
++#define BRV32P_UART_CLKDIV       0xc   /* RW: 16-bit divider, reset 867 */
++
++#define BRV32P_UART_STATUS_TX_BUSY    (1 << 0)
++#define BRV32P_UART_STATUS_RX_VALID   (1 << 1)
++#define BRV32P_UART_STATUS_RX_OVERRUN (1 << 2)
++
++#define BRV32P_UART_CLKDIV_RESET 867
++
++struct BRV32PUARTState {
++    /*< private >*/
++    SysBusDevice parent_obj;
++
++    /*< public >*/
++    MemoryRegion mmio;
++    qemu_irq irq;
++    CharFrontend chr;
++
++    /* Clock the divider counts, in Hz (property "clock-frequency") */
++    uint64_t freq;
++
++    uint16_t clk_div;
++    bool tx_busy;
++    bool rx_busy;        /* a frame is being received */
++    bool rx_valid;
++    bool rx_overrun;
++    uint8_t rx_data;
++    uint8_t rx_shift;    /* the byte of the frame being received */
++
++    QEMUTimer *tx_timer;
++    QEMUTimer *rx_timer;
++};
++
++#endif /* HW_CHAR_BRV32P_UART_H */

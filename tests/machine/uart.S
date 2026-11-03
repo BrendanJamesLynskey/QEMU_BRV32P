@@ -85,7 +85,7 @@ RVTEST_CODE_BEGIN
   # flag is set, the read clears it
   li      TESTNUM, 5
   PUTC('>')
-  li      t3, 50000000
+  li      t3, 0x20000000
 1:lw      t1, U_STATUS(s0)
   andi    t1, t1, ST_VALID
   bnez    t1, 2f
@@ -106,7 +106,7 @@ RVTEST_CODE_BEGIN
   csrw    mie, t1
   csrsi   mstatus, MSTATUS_MIE
   PUTC('>')
-  li      t3, 50000000
+  li      t3, 0x20000000
 1:bnez    s2, 2f
   addi    t3, t3, -1
   bnez    t3, 1b
@@ -122,14 +122,14 @@ RVTEST_CODE_BEGIN
   # overrun flag is set and the last byte is the one kept
   li      TESTNUM, 7
   PUTC('>')
-  li      t3, 50000000
+  li      t3, 0x20000000
 1:lw      t1, U_STATUS(s0)
   andi    t1, t1, ST_OVERRUN
   bnez    t1, 2f
   addi    t3, t3, -1
   bnez    t3, 1b
   j       fail
-2:li      t3, 50000000            # read until the last byte, 'e', is there
+2:li      t3, 0x20000000            # read until the last byte, 'e', is there
 3:lw      t1, U_RX(s0)
   li      t2, 'e'
   beq     t1, t2, 4f

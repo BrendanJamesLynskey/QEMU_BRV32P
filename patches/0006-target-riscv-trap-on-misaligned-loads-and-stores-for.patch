@@ -1,4 +1,4 @@
-From 85fe5a03444821f8c4d9347b5b06ca33a08b6c6d Mon Sep 17 00:00:00 2001
+From ee1a8a9c8f9862c085b1bb915f6a6ee82fcdff04 Mon Sep 17 00:00:00 2001
 From: Brendan Lynskey <brendanlynskey@googlemail.com>
 Date: Tue, 3 Nov 2026 01:17:59 +0000
 Subject: [PATCH 6/6] target/riscv: trap on misaligned loads and stores for the

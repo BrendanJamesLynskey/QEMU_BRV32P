@@ -1,4 +1,4 @@
-From def42d01e198026d2f0fee6addacd3f2853ad3cd Mon Sep 17 00:00:00 2001
+From 5eaefa14537e055c980fa91a7febb35cabd07499 Mon Sep 17 00:00:00 2001
 From: Brendan Lynskey <brendanlynskey@googlemail.com>
 Date: Tue, 3 Nov 2026 01:17:59 +0000
 Subject: [PATCH 3/6] hw/gpio: add the BRV32P GPIO

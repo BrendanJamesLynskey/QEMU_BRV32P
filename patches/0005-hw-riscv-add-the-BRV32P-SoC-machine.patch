@@ -1,4 +1,4 @@
-From 16312a914d26662faabd44e762604c932daf28d1 Mon Sep 17 00:00:00 2001
+From 806d64b8842dfcd1abe6aac112fcfead09c722b5 Mon Sep 17 00:00:00 2001
 From: Brendan Lynskey <brendanlynskey@googlemail.com>
 Date: Tue, 3 Nov 2026 01:17:59 +0000
 Subject: [PATCH 5/6] hw/riscv: add the BRV32P SoC machine
@@ -46,7 +46,7 @@ index de37c08..1244208 100644
      default y
 diff --git a/hw/riscv/brv32p.c b/hw/riscv/brv32p.c
 new file mode 100644
-index 0000000..fb7f121
+index 0000000..69e52d4
 --- /dev/null
 +++ b/hw/riscv/brv32p.c
 @@ -0,0 +1,225 @@
@@ -84,11 +84,11 @@ index 0000000..fb7f121
 +#include "elf.h"
 +
 +static const MemMapEntry brv32p_memmap[] = {
-+    [BRV32P_SRAM] =       { 0x00000000, 0x8000 },
-+    [BRV32P_SRAM_ALIAS] = { 0x80000000, 0x8000 },
-+    [BRV32P_GPIO] =       { 0x20000000, 0x100 },
-+    [BRV32P_UART] =       { 0x20000100, 0x100 },
-+    [BRV32P_TIMER] =      { 0x20000200, 0x100 },
++    [BRV32P_DEV_SRAM] =       { 0x00000000, 0x8000 },
++    [BRV32P_DEV_SRAM_ALIAS] = { 0x80000000, 0x8000 },
++    [BRV32P_DEV_GPIO] =       { 0x20000000, 0x100 },
++    [BRV32P_DEV_UART] =       { 0x20000100, 0x100 },
++    [BRV32P_DEV_TIMER] =      { 0x20000200, 0x100 },
 +};
 +
 +/* Where the ELF loader finds "tohost"; 0 if the image has no such symbol */
@@ -162,12 +162,12 @@ index 0000000..fb7f121
 +    }
 +
 +    /* The SRAM and its alias where the riscv-tests are linked */
-+    memory_region_add_subregion(sys_mem, memmap[BRV32P_SRAM].base,
++    memory_region_add_subregion(sys_mem, memmap[BRV32P_DEV_SRAM].base,
 +                                machine->ram);
 +    memory_region_init_alias(&s->sram_alias, OBJECT(machine),
 +                             "riscv.brv32p.sram.alias", machine->ram, 0,
-+                             memmap[BRV32P_SRAM_ALIAS].size);
-+    memory_region_add_subregion(sys_mem, memmap[BRV32P_SRAM_ALIAS].base,
++                             memmap[BRV32P_DEV_SRAM_ALIAS].size);
++    memory_region_add_subregion(sys_mem, memmap[BRV32P_DEV_SRAM_ALIAS].base,
 +                                &s->sram_alias);
 +
 +    /* The image: an ELF is loaded where it is linked and started at its entry */
@@ -215,7 +215,7 @@ index 0000000..fb7f121
 +    object_initialize_child(OBJECT(machine), "gpio", &s->gpio,
 +                            TYPE_BRV32P_GPIO);
 +    sysbus_realize(SYS_BUS_DEVICE(&s->gpio), &error_fatal);
-+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->gpio), 0, memmap[BRV32P_GPIO].base);
++    sysbus_mmio_map(SYS_BUS_DEVICE(&s->gpio), 0, memmap[BRV32P_DEV_GPIO].base);
 +    sysbus_connect_irq(SYS_BUS_DEVICE(&s->gpio), 0,
 +                       qdev_get_gpio_in(DEVICE(&s->ext_irq), 0));
 +
@@ -228,9 +228,9 @@ index 0000000..fb7f121
 +                                 "riscv.brv32p.gpio.alias",
 +                                 sysbus_mmio_get_region(SYS_BUS_DEVICE(&s->gpio),
 +                                                        0),
-+                                 0, memmap[BRV32P_GPIO].size);
++                                 0, memmap[BRV32P_DEV_GPIO].size);
 +        memory_region_add_subregion(sys_mem,
-+                                    memmap[BRV32P_GPIO].base + (i + 3) * 0x100,
++                                    memmap[BRV32P_DEV_GPIO].base + (i + 3) * 0x100,
 +                                    &s->gpio_alias[i]);
 +    }
 +
@@ -240,14 +240,14 @@ index 0000000..fb7f121
 +        qdev_prop_set_chr(DEVICE(&s->uart), "chardev", serial_hd(0));
 +    }
 +    sysbus_realize(SYS_BUS_DEVICE(&s->uart), &error_fatal);
-+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->uart), 0, memmap[BRV32P_UART].base);
++    sysbus_mmio_map(SYS_BUS_DEVICE(&s->uart), 0, memmap[BRV32P_DEV_UART].base);
 +    sysbus_connect_irq(SYS_BUS_DEVICE(&s->uart), 0,
 +                       qdev_get_gpio_in(DEVICE(&s->ext_irq), 1));
 +
 +    object_initialize_child(OBJECT(machine), "timer", &s->timer,
 +                            TYPE_BRV32P_TIMER);
 +    sysbus_realize(SYS_BUS_DEVICE(&s->timer), &error_fatal);
-+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->timer), 0, memmap[BRV32P_TIMER].base);
++    sysbus_mmio_map(SYS_BUS_DEVICE(&s->timer), 0, memmap[BRV32P_DEV_TIMER].base);
 +    sysbus_connect_irq(SYS_BUS_DEVICE(&s->timer), 0,
 +                       qdev_get_gpio_in(cpu_dev, IRQ_M_TIMER));
 +}
@@ -261,7 +261,7 @@ index 0000000..fb7f121
 +    mc->max_cpus = 1;
 +    mc->default_cpu_type = TYPE_RISCV_CPU_BRV32P;
 +    mc->default_ram_id = "riscv.brv32p.sram";
-+    mc->default_ram_size = brv32p_memmap[BRV32P_SRAM].size;
++    mc->default_ram_size = brv32p_memmap[BRV32P_DEV_SRAM].size;
 +}
 +
 +static const TypeInfo brv32p_machine_types[] = {
@@ -289,7 +289,7 @@ index 0d82cea..236cf04 100644
  riscv_ss.add(when: 'CONFIG_SHAKTI_C', if_true: files('shakti_c.c'))
 diff --git a/include/hw/riscv/brv32p.h b/include/hw/riscv/brv32p.h
 new file mode 100644
-index 0000000..46f02ca
+index 0000000..6f16213
 --- /dev/null
 +++ b/include/hw/riscv/brv32p.h
 @@ -0,0 +1,52 @@
@@ -337,11 +337,11 @@ index 0000000..46f02ca
 +};
 +
 +enum {
-+    BRV32P_SRAM,
-+    BRV32P_SRAM_ALIAS,
-+    BRV32P_GPIO,
-+    BRV32P_UART,
-+    BRV32P_TIMER,
++    BRV32P_DEV_SRAM,
++    BRV32P_DEV_SRAM_ALIAS,
++    BRV32P_DEV_GPIO,
++    BRV32P_DEV_UART,
++    BRV32P_DEV_TIMER,
 +};
 +
 +#endif /* HW_RISCV_BRV32P_H */

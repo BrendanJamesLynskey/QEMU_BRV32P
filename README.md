@@ -51,6 +51,13 @@ The GPIO pins are the QOM properties `gpio-in` (writable) and `gpio-out` of `/ma
 for its env, linker script, directed tests and firmware generator, and `riscv64-unknown-elf-gcc`. They write
 `tests/build/*/results.txt`.
 
+## Results
+
+On QEMU `v11.1.3` plus the patches: 118 / 118 of the ISA tests run (rv32ui 41, rv32um 8, rv32uc 1, rv32ui-c 40,
+rv32um-c 8, the core repo's directed tests without custom instructions 6, rv32mi 14), and 4 / 4 of the machine
+tests (SoC firmware, timer, UART, GPIO). The 12 tests not run are listed with their reasons in
+[`tests/run_isa.sh`](tests/run_isa.sh).
+
 ## Licence
 
 The patches are for QEMU and are GPL-2.0-or-later ([`LICENSE`](LICENSE) is the GPL-2.0 text from QEMU).

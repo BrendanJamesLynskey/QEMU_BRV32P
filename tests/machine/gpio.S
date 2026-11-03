@@ -6,7 +6,8 @@
  * Written for the machine model. The host drives the pins through the QOM
  * property gpio-in and reads them back from gpio-out (tests/run_machine.py).
  * Handshake on the UART: '>' ready for the pin changes, 'a' first interrupt
- * seen, 'b' second interrupt seen and the outputs set.
+ * seen, 'b' second interrupt seen and the outputs set; then the program waits
+ * for any byte from the host (which has read the pins) and ends.
  */
 
 #include "riscv_test.h"
@@ -102,14 +103,14 @@ RVTEST_CODE_BEGIN
   csrw    mie, t1
   csrsi   mstatus, MSTATUS_MIE
   PUTC('>')
-  li      t3, 50000000
+  li      t3, 0x20000000
 1:li      t4, 1
   bge     s2, t4, 2f
   addi    t3, t3, -1
   bnez    t3, 1b
   j       fail
 2:PUTC('a')
-  li      t3, 50000000
+  li      t3, 0x20000000
 1:li      t4, 2
   bge     s2, t4, 2f
   addi    t3, t3, -1
@@ -125,7 +126,16 @@ RVTEST_CODE_BEGIN
   li      t1, 0x3c
   sw      t1, G_DIR(s0)
   PUTC('b')
-
+  # wait for the host to read the pins and send a byte, so that the run does
+  # not end before it has
+  li      t3, 0x20000000
+1:lw      t1, U_STATUS(s1)
+  andi    t1, t1, 2
+  bnez    t1, 2f
+  addi    t3, t3, -1
+  bnez    t3, 1b
+  j       fail
+2:
   TEST_PASSFAIL
 
   .align  2

@@ -155,7 +155,7 @@ def test_gpio():
         q.wait_for(b">")
         # a rising edge on pin 1, whose interrupt is not enabled: no interrupt
         q.qmp("qom-set", path=path, property="gpio-in", value=2)
-        time.sleep(0.2)
+        time.sleep(0.1)
         assert b"a" not in q.out, "an interrupt for a pin that is not enabled"
         q.qmp("qom-set", path=path, property="gpio-in", value=3)       # pin 0 rises
         q.wait_for(b"a")
@@ -164,6 +164,7 @@ def test_gpio():
         q.wait_for(b"b")
         out = q.qmp("qom-get", path=path, property="gpio-out")
         assert out == 0x3c, "gpio-out is %#x, expected 0x3c" % out
+        q.send(b"g")                  # let the program end
         rc = q.wait_exit()
     finally:
         q.close()

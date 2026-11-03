@@ -63,10 +63,9 @@ declare -A SKIP=(
   [directed/gf]="uses the custom GF(2^8) instructions (step Q2)"
   [directed/mq]="uses the custom mod-q instructions (step Q2)"
   [directed/mul_use]="uses the custom DSP extension (step Q2)"
-  # rv32mi tests of CSRs and features the core does not have
-  [rv32mi/pmpaddr]="needs PMP; the core has none"
-  [rv32mi/zicntr]="needs the Zicntr counters; the core has mcycle/minstret only"
-  [rv32mi/instret_overflow]="needs a 64-bit minstret with minstreth; the core has the low word only"
+  # rv32mi tests of features the core does not have (the model fails them too)
+  [rv32mi/pmpaddr]="needs PMP; the core has none (fails at test case 1 on the model)"
+  [rv32mi/instret_overflow]="needs a writable minstret and minstreth; the core cannot write minstret, and the model's counts instructions (fails at test case 2)"
 )
 
 : > "$B/results.txt"

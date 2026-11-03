@@ -245,7 +245,7 @@ Left out, and where the model therefore differs from the RTL:
 | **AXI** and the bridge handshakes. | No bus latency, no write-buffer ordering. |
 | Aliases of the SRAM other than 0x0 and 0x8000_0000; the repeat of the peripheral window through `0x2xxx_xxxx`; SRAM beyond 32 KB (the RTL wraps, the model has an access fault). | A program that relies on wrap-around differs. |
 | The 2- and 3-clock input delay of the GPIO. | A pin change is seen at once. |
-| **Unknown CSRs, `WFI`.** | The RTL reads 0 / ignores a CSR it does not have, and `WFI` traps; QEMU raises an illegal-instruction exception for an unknown CSR and runs `WFI`. A binary that passes on the RTL does not use them. |
+| **Unknown CSRs, `WFI`.** | The RTL reads 0 and ignores writes for any CSR it does not have (no trap), and `WFI` traps. In the model a CSR that does not exist raises an illegal-instruction exception (`time`, the `0x7c0` custom range), the generic CSRs `cycle`, `instret`, `misa` and `mvendorid` read their own values (the RTL reads 0), and `WFI` runs. A binary that passes on the RTL does not use them. |
 | `mstatus.MPP`, `misa`, `mtvec` vectored mode, the other machine CSRs of section 3. | QEMU's CSR unit is the generic RISC-V one: `mstatus` reads with `MPP = 3`, `misa` exists. |
 
 ### A finding in the RTL: peripheral registers go through the D-cache

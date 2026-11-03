@@ -1,0 +1,81 @@
+# CI: build QEMU at the pinned release with the patch series, then run the
+# BRV32P tests on it: the core repo's ISA tests, the SoC firmware, and the
+# machine tests.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CORE_REPO_URL: BrendanJamesLynskey/RISCV_RV32IMC_5stage
+  RISCV_TESTS_REV: 3df703cd52d5f0d8224e3c50bf03c6cb70efff98    # riscv-tests, as the core repo's CI
+
+jobs:
+  test:
+    name: Build QEMU and run the BRV32P tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools and the RISC-V toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-riscv64-unknown-elf ninja-build pkg-config \
+            libglib2.0-dev libpixman-1-dev python3-venv python3-pip ccache
+
+      - name: Core repo (RTL tests, firmware generator, env and linker script)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.CORE_REPO_URL }}
+          path: core
+
+      - name: Restore the QEMU build
+        id: qemu-cache
+        uses: actions/cache@v4
+        with:
+          path: build/qemu/qemu-system-riscv32
+          key: qemu-${{ hashFiles('QEMU_VERSION', 'patches/*.patch', 'scripts/build.sh') }}
+
+      - name: Build QEMU (pinned release plus patches)
+        if: steps.qemu-cache.outputs.cache-hit != 'true'
+        run: JOBS="$(nproc)" scripts/build.sh
+
+      - name: QEMU version and machine
+        run: |
+          build/qemu/qemu-system-riscv32 --version
+          build/qemu/qemu-system-riscv32 -M help | grep brv32p
+          build/qemu/qemu-system-riscv32 -cpu help | grep brv32p
+
+      - name: ISA tests (riscv-tests and the core repo's directed tests) and rv32mi
+        run: |
+          export CORE_REPO="$PWD/core" RISCV_TESTS="$PWD/core/tests/isa/riscv-tests"
+          git clone -q https://github.com/riscv-software-src/riscv-tests.git "$RISCV_TESTS"
+          git -C "$RISCV_TESTS" checkout -q "$RISCV_TESTS_REV"
+          git -C "$RISCV_TESTS" submodule update -q --init env
+          tests/run_isa.sh
+
+      - name: Machine tests (SoC firmware, timer, UART, GPIO)
+        run: CORE_REPO="$PWD/core" RISCV_TESTS="$PWD/core/tests/isa/riscv-tests" tests/run_machine.py
+
+      - name: Short report
+        if: always()
+        run: |
+          {
+            echo "## BRV32P QEMU model"
+            echo "QEMU $(cat QEMU_VERSION) plus $(ls patches/*.patch | wc -l) patches"
+            echo '```'
+            grep -h -E "^suite|passed" tests/build/isa/results.txt tests/build/machine/results.txt || true
+            grep -h -E "FAIL|BUILD" tests/build/isa/results.txt tests/build/machine/results.txt || true
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY" > tests/build/report.md
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: brv32p-qemu-results
+          path: |
+            tests/build/report.md
+            tests/build/isa/results.txt
+            tests/build/machine/results.txt

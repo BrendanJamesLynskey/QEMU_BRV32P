@@ -1,0 +1,57 @@
+From 8978198437b7841de90643cd89a22b8c159a492b Mon Sep 17 00:00:00 2001
+From: Brendan Lynskey <brendanlynskey@googlemail.com>
+Date: Tue, 3 Nov 2026 01:17:59 +0000
+Subject: [PATCH 1/6] target/riscv: add the BRV32P CPU
+
+The BRV32P is a 5-stage in-order core that implements RV32IMC in machine
+mode only, with Zicsr, Zifencei and the scalar crypto subsets Zbkb, Zbkc,
+Zbkx, Zknd, Zkne and Zknh. It has no PMP, no user or supervisor mode and no
+counters other than mcycle and minstret.
+
+Signed-off-by: Brendan Lynskey <brendanlynskey@googlemail.com>
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ target/riscv/cpu-qom.h |  1 +
+ target/riscv/cpu.c     | 16 ++++++++++++++++
+ 2 files changed, 17 insertions(+)
+
+diff --git a/target/riscv/cpu-qom.h b/target/riscv/cpu-qom.h
+index 1a28f13..c1bcad3 100644
+--- a/target/riscv/cpu-qom.h
++++ b/target/riscv/cpu-qom.h
+@@ -42,6 +42,7 @@
+ #define TYPE_RISCV_CPU_RVA22S64         RISCV_CPU_TYPE_NAME("rva22s64")
+ #define TYPE_RISCV_CPU_RVA23U64         RISCV_CPU_TYPE_NAME("rva23u64")
+ #define TYPE_RISCV_CPU_RVA23S64         RISCV_CPU_TYPE_NAME("rva23s64")
++#define TYPE_RISCV_CPU_BRV32P           RISCV_CPU_TYPE_NAME("brv32p")
+ #define TYPE_RISCV_CPU_IBEX             RISCV_CPU_TYPE_NAME("lowrisc-ibex")
+ #define TYPE_RISCV_CPU_SHAKTI_C         RISCV_CPU_TYPE_NAME("shakti-c")
+ #define TYPE_RISCV_CPU_SIFIVE_E         RISCV_CPU_TYPE_NAME("sifive-e")
+diff --git a/target/riscv/cpu.c b/target/riscv/cpu.c
+index b04beee..7f31e2f 100644
+--- a/target/riscv/cpu.c
++++ b/target/riscv/cpu.c
+@@ -3296,6 +3296,22 @@ static const TypeInfo riscv_cpu_type_infos[] = {
+         .cfg.ext_svvptc = true,
+     ),
+ 
++    DEFINE_RISCV_CPU(TYPE_RISCV_CPU_BRV32P, TYPE_RISCV_VENDOR_CPU,
++        .misa_mxl_max = MXL_RV32,
++        .misa_ext = RVI | RVM | RVC,
++        .priv_spec = PRIV_VERSION_1_12_0,
++        .cfg.max_satp_mode = VM_1_10_MBARE,
++        .cfg.ext_zifencei = true,
++        .cfg.ext_zicsr = true,
++
++        .cfg.ext_zbkb = true,
++        .cfg.ext_zbkc = true,
++        .cfg.ext_zbkx = true,
++        .cfg.ext_zknd = true,
++        .cfg.ext_zkne = true,
++        .cfg.ext_zknh = true
++    ),
++
+     DEFINE_RISCV_CPU(TYPE_RISCV_CPU_IBEX, TYPE_RISCV_VENDOR_CPU,
+         .misa_mxl_max = MXL_RV32,
+         .misa_ext = RVI | RVM | RVC | RVU,

@@ -62,6 +62,11 @@ declare -A SKIP=(
   [rv32mi/instret_overflow]="needs a writable minstret and minstreth; the core cannot write minstret, and the model's counts instructions (fails at test case 2)"
 )
 
+# Virtual time per instruction is 2^shift ns (default 8 ns). The timer ticks every 10 ns, so with the
+# default two back-to-back reads of its count can fall in the same tick (the RTL's loads take several
+# cycles): periph_uncached, which needs them to differ, runs at 16 ns per instruction.
+declare -A SHIFT=( [directed/periph_uncached]=4 )
+
 : > "$B/results.txt"
 total=0; fails=0; skipped=0
 for suite in "${SUITES[@]}"; do
@@ -81,7 +86,7 @@ for suite in "${SUITES[@]}"; do
       scount=$((scount + 1)); fails=$((fails + 1)); continue
     fi
     timeout 60 "$QEMU" -M brv32p -display none -monitor none -serial none -no-reboot \
-      -icount shift=3 -kernel "$out.elf" > "$out.log" 2>&1
+      -icount shift=${SHIFT[$t]:-3} -kernel "$out.elf" > "$out.log" 2>&1
     rc=$?
     scount=$((scount + 1))
     case $rc in

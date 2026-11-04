@@ -142,6 +142,8 @@ def header(title):
 
 RVTEST_RV32U
 RVTEST_CODE_BEGIN
+
+  li TESTNUM, 2                 # nonzero, so that TEST_PASSFAIL passes
 """
 
 

@@ -21,9 +21,10 @@ which compares Spike with the RTL:
   too; Spike (like the RTL's retire trace) does not log it. The `-d int` line
   QEMU prints for a synchronous exception names the instruction (epc), and
   that record is dropped.
-* The run ends at QEMU's store to `tohost`. Spike keeps running a few
-  instructions until its host interface sees that store, so its log is cut at
-  the matching record, which must be the store to --tohost if that is given.
+* The run ends at the test's store to `tohost` (QEMU goes on for a few
+  instructions of the `j .` that follows it, until its main loop sees the
+  shutdown request, and Spike until its host interface sees the store), so
+  both logs are cut at that store, which must be there if --tohost is given.
 * Stores are compared by instruction, not by data (the plugin logs the
   address, not the data).
 
@@ -92,7 +93,7 @@ def qemu_records(path, start_pc):
         line = line.rstrip("\n")
         t = QTRAP.search(line)
         if t:
-            drop_epc = int(t.group(1), 16)
+            drop_epc = int(t.group(1), 16) & 0xFFFFFFFF   # QEMU prints the pc sign-extended
             continue
         m = QLINE.match(line)
         if not m:
@@ -144,6 +145,7 @@ def main():
     cover = Counter()
     n = 0
     last_s = None
+    ended = False
     spike = spike_records(spath, start_pc)
     for q in qemu_records(qpath, start_pc):
         s = next(spike, None)
@@ -180,12 +182,14 @@ def main():
             cover[name] += 1
         n += 1
         last_s = s
+        if tohost is not None and smem == tohost:
+            ended = True                      # the test's store to tohost: the run is over
+            break
     if n == 0:
         print("NO INSTRUCTIONS in the QEMU log")
         return 1
-    if tohost is not None and (last_s[3] != tohost):
-        print(f"END MISMATCH: QEMU's last instruction was not the store to tohost ({tohost:#x}) "
-              f"(Spike: mem {last_s[3] if last_s[3] is None else hex(last_s[3])}); "
+    if tohost is not None and not ended:
+        print(f"END MISMATCH: QEMU's log ended without the store to tohost ({tohost:#x}); "
               f"the first {n} instructions match")
         return 1
     rest = sum(1 for _ in spike)

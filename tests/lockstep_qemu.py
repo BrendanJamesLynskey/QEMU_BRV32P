@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Compare QEMU's execution log with Spike's commit log, instruction by instruction.
 
-Usage: lockstep_qemu.py <qemu.log> <spike.log> [--tohost ADDR] [--start-pc ADDR]
+Usage: lockstep_qemu.py <qemu.log> <spike.log> [--tohost ADDR] [--start-pc ADDR] [--ignore-pc ADDR ...]
 
 The QEMU log is the output of its `execlog` TCG plugin (run with
 `-d plugin,int`, the plugin watching the 31 general registers). The Spike log
@@ -27,6 +27,10 @@ which compares Spike with the RTL:
   both logs are cut at that store, which must be there if --tohost is given.
 * Stores are compared by instruction, not by data (the plugin logs the
   address, not the data).
+
+* The second log may also be the RTL's retire trace (tb_isa.v +trace=), which is in
+  Spike's format. --ignore-pc ADDR (repeatable) skips the register-value check at one pc, for
+  an instruction whose result differs by design between platforms (a read of mcycle).
 
 Exits 0 if the two match for the whole of QEMU's run; otherwise prints the
 first mismatch with context and exits 1. A summary line gives the number of
@@ -128,8 +132,9 @@ def spike_records(path, start_pc):
 
 def main():
     args = sys.argv[1:]
-    tohost = start_pc = None
+    tohost = None
     start_pc = 0x80000000
+    ignore = set()
     paths = []
     while args:
         a = args.pop(0)
@@ -137,6 +142,8 @@ def main():
             tohost = int(args.pop(0), 16)
         elif a == "--start-pc":
             start_pc = int(args.pop(0), 16)
+        elif a == "--ignore-pc":
+            ignore.add(int(args.pop(0), 16))
         else:
             paths.append(a)
     qpath, spath = paths
@@ -161,7 +168,9 @@ def main():
         else:
             for r, v in qwrites.items():
                 shadow[r] = v
-            if sreg is not None:
+            if qpc in ignore:
+                pass                                    # a result that differs by design (mcycle)
+            elif sreg is not None:
                 r, v = sreg
                 if shadow[r] != v:
                     problem = f"x{r}: QEMU {shadow[r]:#010x}, Spike {v:#010x}"

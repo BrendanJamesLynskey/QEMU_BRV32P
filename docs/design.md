@@ -264,7 +264,7 @@ registers can be polled on the RTL as they are on the model.
 
 **Q2: the custom extensions.** Done: section 9 (the design) and section 10 (the tests).
 
-**Q3: one ELF, three simulators.** A CI job builds a test ELF once, runs it on QEMU, on Spike (with the
+**Q3: one ELF, three simulators.** Done: section 11 (what runs where) and section 12 (what is compared). The plan was: a CI job builds a test ELF once, runs it on QEMU, on Spike (with the
 extension library) and on the RTL (Icarus), and compares: the final `tohost` value, the UART output, and for
 the instructions both sides can log, the commit log (QEMU's `-d` trace against Spike's `--log-commits`, as the
 core repo's `lockstep.py` already compares Spike with the RTL). The three results must agree on pass/fail and
@@ -401,3 +401,76 @@ random with a bias to the edges (0, -1, the 16- and 32-bit limits), the results 
 | `rand_mq` | the six mod-q operations over 8 configurations of `q` and `q'` (the ML-KEM, 12289 and 7681 pairs, a `q'` that is not -q^-1, `q` = 0, 1 and 65535) with a new random `zeta` for every operand set; `mq.cfg`, `mq.zeta`, `mq.rd`, `mq.rdz` |
 | `rand_agu` | `ar.set` `ar.cfg` `ar.mode` `ar.rd` `ar.rds` `ar.rdm` `lh.a` `lw.a` `lhu.a` over random address register, start, stride and load kind, plain (56 chains) and bit-reversed (32 chains) |
 | `rand_loop` | 120 loops of random count (0 to 60) and shape (`mac.lp`, `dmac.lp`, `msu.lp` and `lp.end` as last instruction; a load, a branch or a GF multiply in the body; set up by `lp.setup` or `lp.set` and `lp.sets`), reading `lc` and `lp_start` with `lp.rd` and `lp.rds` |
+
+## 11. Q3: one ELF on three platforms
+
+`tests/run_three.sh` builds each program **once** and runs that ELF on the QEMU model (`-M brv32p`), on Spike
+(with the core repo's `libxbrvdsp.so`) and on the RTL (the core repo's `tests/isa/tb_isa.v` under Icarus
+Verilog, the image made from the ELF by the core repo's `elf2hex.py`, as its `run_isa.sh` does). The core
+repo's env and linker script are used unchanged. The SHA-256 of every ELF is recorded (`sha256.txt`).
+
+| Programs | Count | Source | Spike | Commit logs |
+|---|---|---|---|---|
+| the core repo's directed tests | 14 | `tests/directed` | all but `dsp_irq`, `timer_irq`, `periph_uncached` (they use the timer, which Spike lacks) | all but those three |
+| randomised operand tests | 5 | `tests/gen_random.py` | yes | yes |
+| `dsp_small` | 1 | the core repo's `tests/bench` kernels (FIR in plain C and with `mac`, `dmac`, the address generators and the hardware loop; energy; ML-KEM NTT and inverse NTT as the reference and with the mod-q unit), main in `tests/three/dsp_small.c` | yes | yes |
+| `firmware` | 1 | the SoC firmware (`firmware/firmware.hex`) as an ELF that ends through `tohost` | no (UART and GPIO) | QEMU against RTL |
+| `uart_hello` | 1 | `tests/three/uart_hello.S`: prints a line on the UART | no (UART) | none |
+
+That is 22 programs: Q2's 14 directed tests and 5 randomised tests (its 11 lockstep programs are six of the directed tests and the five random ones) and three new ones.
+
+**`dsp_small`** is the real program. The core repo's benchmark (`tests/bench/dsp.c` and the rest) is 38 KB of
+code and links for 64 KB of SRAM; the SoC has 32 KB. So `tests/three/build_dsp_small.sh` compiles the core
+repo's `dsp.c`, `mlkem.c`, `mlkem_x.c` and `crt.S` unchanged, renames `dsp.c`'s `main` and links with
+`--gc-sections` against a `main` of its own that calls the FIR, energy and NTT kernels and checks each against
+the values `gen_data.py` computes. The core repo's linker script is used with its two numbers for the top of
+memory lowered by 32 KB (by `sed`, at build time). The ELF is 6 KB of code and runs in about 116,000
+instructions.
+
+**`firmware`**: the core repo's firmware is a straight line that ends in an `ECALL` (with `mtvec` = 0 the trap
+restarts it) and is judged by its own testbench looking at registers; it never stores to `tohost`.
+`tests/three/firmware_tohost.py` writes the same instruction words, up to the `ECALL`, as an assembly file,
+followed by a check of the 14 registers the firmware computes and the store to `tohost`. Nothing in the core
+repo changes. The `ECALL` restart is not exercised (it is covered by the machine test, `tests/run_machine.py`).
+It is linked at 0x80000000 like the other programs and aliases the same SRAM; it prints `H`.
+
+**The UART on the RTL.** `tb_isa.v` leaves `uart_tx` unconnected. `tests/three/uart_mon.v` is a second
+top-level module compiled beside it: it reads `tb_isa.uart_tx` and the UART's `clk_div` by hierarchical name,
+decodes the 8N1 frames and writes the bytes to a file. `tb_isa.v` is not changed.
+
+**Not on the board.** The same ELF loads on the board through the core repo's flow (`elf2hex.py` and its
+FPGA build); that run is separate from this step.
+
+## 12. Q3: what is compared, and what cannot be
+
+`tests/three_compare.py` checks, per program, that the platforms agree on:
+
+1. **The verdict.** QEMU and Spike by exit status (the value stored to `tohost` >> 1; 0 is a pass, N a
+   failure in test case N, 57 the env's trap value 1337 mod 256), the RTL by the testbench's `RESULT` line.
+   All must agree, and a program that does not pass fails the job even if they agree.
+2. **The UART output**, QEMU against RTL. Spike has no UART. Programs that print nothing agree on nothing.
+3. **The commit log**, for each pair that can log it. QEMU against Spike (QEMU's `execlog` plugin against
+   `--log-commits`, `tests/lockstep_qemu.py`, as in Q2); RTL against Spike (the core repo's `lockstep.py`);
+   RTL against QEMU (`tests/lockstep_qemu.py` reading the RTL's retire trace, which has Spike's format). Each
+   compares the pc, the encoding and the register written, per retired instruction, and ends at the store to
+   `tohost`. The instruction counts of the pairs must be equal.
+
+Cycle counts are not compared: the model has no timing. The report gives the RTL's cycles, and the number of
+instructions compared (which is QEMU's instruction count up to the store to `tohost`).
+
+What cannot be compared:
+
+* **Spike has no timer and no UART**, so `dsp_irq`, `timer_irq`, `periph_uncached`, `firmware` and
+  `uart_hello` do not run on it, as Q2 found.
+* **Commit logs of programs that depend on time.** `dsp_irq` and `timer_irq` take an interrupt at an
+  instruction that depends on how many cycles have passed; `periph_uncached` reads the timer count, whose
+  value depends on cycles; `uart_hello` polls the transmitter, so its loop runs a different number of times on
+  each platform. These are compared on the verdict (and for `uart_hello` the output) only.
+* **`firmware` reads `mcycle` once**; the register value written by that one instruction is not compared
+  (`--ignore-pc`), all other instructions of the program are.
+
+The check is itself checked: `three_compare.py --selftest` corrupts copies of one program's results (a verdict,
+a UART byte, a register value in the RTL trace, one in the Spike log) and fails unless each is caught. CI runs it
+after the runs.
+
+Results of the last green run are in [`results_q3.md`](results_q3.md).

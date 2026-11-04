@@ -417,7 +417,7 @@ repo's env and linker script are used unchanged. The SHA-256 of every ELF is rec
 | `firmware` | 1 | the SoC firmware (`firmware/firmware.hex`) as an ELF that ends through `tohost` | no (UART and GPIO) | QEMU against RTL |
 | `uart_hello` | 1 | `tests/three/uart_hello.S`: prints a line on the UART | no (UART) | none |
 
-That is 22 programs, 19 distinct from Q2's (the 14 directed tests and the 11 lockstep programs overlap in six).
+That is 22 programs: Q2's 14 directed tests and 5 randomised tests (its 11 lockstep programs are six of the directed tests and the five random ones) and three new ones.
 
 **`dsp_small`** is the real program. The core repo's benchmark (`tests/bench/dsp.c` and the rest) is 38 KB of
 code and links for 64 KB of SRAM; the SoC has 32 KB. So `tests/three/build_dsp_small.sh` compiles the core

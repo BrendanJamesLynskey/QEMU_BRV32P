@@ -50,19 +50,13 @@ declare -A LD=( [rv32mi]="$RISCV_TESTS/env/p/link.ld" )
 SUITES=(rv32ui rv32um rv32uc rv32ui-c rv32um-c directed rv32mi)
 [ $# -gt 0 ] && SUITES=("$@")
 
-# Not run, with the reason; the first group is the core repo's own list
+# Not run, with the reason; the first group is the core repo's own list. (The tests that use the
+# custom Xbrvdsp, GF(2^8) and mod-q instructions run since step Q2; tests/run_lockstep.sh also
+# compares them with Spike.)
 declare -A SKIP=(
   [rv32ui/ma_data]="needs misaligned access in hardware; the core and the model trap (see directed/misaligned)"
   [rv32ui-c/ma_data]="as rv32ui/ma_data"
   [rv32ui-c/fence_i]="patches code assuming 32-bit encodings; assembled with C it overwrites compressed code"
-  # Custom Xbrvdsp/GF/mod-q instructions, step Q2
-  [directed/dsp_agu]="uses the custom DSP extension (step Q2)"
-  [directed/dsp_irq]="uses the custom DSP extension (step Q2)"
-  [directed/dsp_loop]="uses the custom DSP extension (step Q2)"
-  [directed/dsp_mac]="uses the custom DSP extension (step Q2)"
-  [directed/gf]="uses the custom GF(2^8) instructions (step Q2)"
-  [directed/mq]="uses the custom mod-q instructions (step Q2)"
-  [directed/mul_use]="uses the custom DSP extension (step Q2)"
   # rv32mi tests of features the core does not have (the model fails them too)
   [rv32mi/pmpaddr]="needs PMP; the core has none (fails at test case 1 on the model)"
   [rv32mi/instret_overflow]="needs a writable minstret and minstreth; the core cannot write minstret, and the model's counts instructions (fails at test case 2)"

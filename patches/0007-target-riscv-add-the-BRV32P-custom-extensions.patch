@@ -1,0 +1,1008 @@
+From 8d55282f584b59d96ae20ab66a9176bdb6936666 Mon Sep 17 00:00:00 2001
+From: Brendan Lynskey <brendanlynskey@googlemail.com>
+Date: Wed, 4 Nov 2026 00:00:27 +0000
+Subject: [PATCH 7/7] target/riscv: add the BRV32P custom extensions
+
+The BRV32P core has a DSP extension, Xbrvdsp, on the custom-0 and custom-1
+opcodes: a multiply-accumulate unit with a 40-bit accumulator, saturating
+and packed-half arithmetic, four address registers with a bit-reversed
+mode, a hardware loop, a packed GF(2^8) multiply and packed arithmetic mod
+q for NTTs.
+
+Add it as a vendor extension of the brv32p CPU only, in the way QEMU's
+other vendor extensions are done: a cfg flag, a decodetree file gated on
+it, and translation routines. The state (accumulator, address registers,
+loop count and start, GF polynomial, q, q' and zeta) is in CPURISCVState,
+reset as the RTL resets it, and migrated in a subsection. The arithmetic is
+in helpers and follows the core's Spike model instruction by instruction.
+
+The last instruction of a hardware loop body (mac.lp, dmac.lp, msu.lp,
+lp.end) picks its next pc at run time from the loop registers and ends the
+translation block. The loads through an address register step it only after
+the load has succeeded, so one that traps leaves it unchanged.
+
+Signed-off-by: Brendan Lynskey <brendanlynskey@googlemail.com>
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ target/riscv/cpu.c                            |  14 +
+ target/riscv/cpu.h                            |  16 +
+ target/riscv/cpu_cfg.h                        |   1 +
+ target/riscv/cpu_cfg_fields.h.inc             |   1 +
+ target/riscv/helper.h                         |  42 ++
+ target/riscv/machine.c                        |  28 ++
+ target/riscv/meson.build                      |   1 +
+ .../riscv/tcg/insn_trans/trans_xbrvdsp.c.inc  | 216 ++++++++++
+ target/riscv/tcg/meson.build                  |   1 +
+ target/riscv/tcg/translate.c                  |   3 +
+ target/riscv/tcg/xbrvdsp_helper.c             | 404 ++++++++++++++++++
+ target/riscv/xbrvdsp.decode                   |  92 ++++
+ 12 files changed, 819 insertions(+)
+ create mode 100644 target/riscv/tcg/insn_trans/trans_xbrvdsp.c.inc
+ create mode 100644 target/riscv/tcg/xbrvdsp_helper.c
+ create mode 100644 target/riscv/xbrvdsp.decode
+
+diff --git a/target/riscv/cpu.c b/target/riscv/cpu.c
+index 19e1764..e549a34 100644
+--- a/target/riscv/cpu.c
++++ b/target/riscv/cpu.c
+@@ -294,6 +294,7 @@ const RISCVIsaExtData isa_edata_arr[] = {
+     ISA_EXT_DATA_ENTRY(svrsw60t59b, PRIV_VERSION_1_13_0, ext_svrsw60t59b),
+     ISA_EXPERIMENTAL_EXT_DATA_ENTRY(svukte, PRIV_VERSION_1_13_0, ext_svukte),
+     ISA_EXT_DATA_ENTRY(svvptc, PRIV_VERSION_1_13_0, ext_svvptc),
++    ISA_EXT_DATA_ENTRY(xbrvdsp, PRIV_VERSION_1_12_0, ext_xbrvdsp),
+     ISA_EXT_DATA_ENTRY(xlrbr, PRIV_VERSION_1_13_0, ext_xlrbr),
+     ISA_EXT_DATA_ENTRY(xmipscbop, PRIV_VERSION_1_12_0, ext_xmipscbop),
+     ISA_EXT_DATA_ENTRY(xmipscmov, PRIV_VERSION_1_12_0, ext_xmipscmov),
+@@ -1088,6 +1089,18 @@ static void riscv_cpu_reset_hold(Object *obj, ResetType type)
+     set_float_default_nan_pattern(0b01000000, &env->fp_status);
+     env->vill = true;
+ 
++    /* Xbrvdsp: the values the BRV32P RTL resets to */
++    env->xdsp_acc = 0;
++    memset(env->xdsp_ar_addr, 0, sizeof(env->xdsp_ar_addr));
++    memset(env->xdsp_ar_stride, 0, sizeof(env->xdsp_ar_stride));
++    memset(env->xdsp_ar_br, 0, sizeof(env->xdsp_ar_br));
++    env->xdsp_lc = 0;
++    env->xdsp_lp_start = 0;
++    env->xdsp_gf_poly = 0x1d;
++    env->xdsp_mq_q = 3329;
++    env->xdsp_mq_qp = 3327;
++    env->xdsp_mq_zeta = 0;
++
+ #ifndef CONFIG_USER_ONLY
+ #ifdef CONFIG_TCG
+     if (cpu->cfg.debug) {
+@@ -3304,6 +3317,7 @@ static const TypeInfo riscv_cpu_type_infos[] = {
+         .cfg.ext_zifencei = true,
+         .cfg.ext_zicsr = true,
+         .cfg.misaligned_trap = true,
++        .cfg.ext_xbrvdsp = true,
+ 
+         .cfg.ext_zbkb = true,
+         .cfg.ext_zbkc = true,
+diff --git a/target/riscv/cpu.h b/target/riscv/cpu.h
+index a583f80..202f1f7 100644
+--- a/target/riscv/cpu.h
++++ b/target/riscv/cpu.h
+@@ -523,6 +523,22 @@ struct CPUArchState {
+     uint64_t rnmi_excpvec;
+ #endif
+ 
++    /*
++     * BRV32P Xbrvdsp state (the accumulator, the address registers, the
++     * hardware loop, the GF(2^8) and mod-q configuration): see
++     * tcg/xbrvdsp_helper.c. Reset as the RTL resets it.
++     */
++    int64_t xdsp_acc;               /* 40 bits, held sign-extended */
++    uint32_t xdsp_ar_addr[4];
++    uint16_t xdsp_ar_stride[4];     /* signed 16 bits, in bytes */
++    uint8_t xdsp_ar_br[4];          /* bit-reversed mode */
++    uint32_t xdsp_lc;               /* loop count */
++    uint32_t xdsp_lp_start;         /* where the loop body begins */
++    uint8_t xdsp_gf_poly;           /* P = x^8 + poly */
++    uint16_t xdsp_mq_q;
++    uint16_t xdsp_mq_qp;
++    uint16_t xdsp_mq_zeta;
++
+     /* Fields from here on are preserved across CPU reset. */
+     QEMUTimer *stimer; /* Internal timer for S-mode interrupt */
+     QEMUTimer *vstimer; /* Internal timer for VS-mode interrupt */
+diff --git a/target/riscv/cpu_cfg.h b/target/riscv/cpu_cfg.h
+index 211d070..f268f25 100644
+--- a/target/riscv/cpu_cfg.h
++++ b/target/riscv/cpu_cfg.h
+@@ -70,5 +70,6 @@ MATERIALISE_EXT_PREDICATE(xtheadmempair)
+ MATERIALISE_EXT_PREDICATE(xtheadsync)
+ MATERIALISE_EXT_PREDICATE(XVentanaCondOps)
+ MATERIALISE_EXT_PREDICATE(xlrbr);
++MATERIALISE_EXT_PREDICATE(xbrvdsp)
+ 
+ #endif
+diff --git a/target/riscv/cpu_cfg_fields.h.inc b/target/riscv/cpu_cfg_fields.h.inc
+index 6da7906..6b28a38 100644
+--- a/target/riscv/cpu_cfg_fields.h.inc
++++ b/target/riscv/cpu_cfg_fields.h.inc
+@@ -157,6 +157,7 @@ BOOL_FIELD(ext_xmipscbop)
+ BOOL_FIELD(ext_xmipscmov)
+ BOOL_FIELD(ext_xmipslsp)
+ BOOL_FIELD(ext_xlrbr)
++BOOL_FIELD(ext_xbrvdsp)
+ 
+ BOOL_FIELD(big_endian)
+ BOOL_FIELD(mmu)
+diff --git a/target/riscv/helper.h b/target/riscv/helper.h
+index 542b7c2..ea92983 100644
+--- a/target/riscv/helper.h
++++ b/target/riscv/helper.h
+@@ -1358,3 +1358,45 @@ DEF_HELPER_1(ssamoswap_disabled, void, env)
+ 
+ /* Zalrsc SC write probe */
+ DEF_HELPER_FLAGS_3(sc_probe_write, TCG_CALL_NO_WG, void, env, tl, tl)
++
++/* BRV32P Xbrvdsp: the DSP extension (accumulator, AGU, loop, GF(2^8), mod q) */
++DEF_HELPER_3(xd_mac, void, env, tl, tl)
++DEF_HELPER_3(xd_dmac, void, env, tl, tl)
++DEF_HELPER_3(xd_msu, void, env, tl, tl)
++DEF_HELPER_2(xd_acc_set, void, env, tl)
++DEF_HELPER_2(xd_acc_seth, void, env, tl)
++DEF_HELPER_2(xd_acc_rd, tl, env, i32)
++DEF_HELPER_2(xd_acc_rdh, tl, env, i32)
++DEF_HELPER_1(xd_acc_rdl, tl, env)
++DEF_HELPER_1(xd_acc_rdx, tl, env)
++DEF_HELPER_3(xd_sadd, tl, env, tl, tl)
++DEF_HELPER_3(xd_ssub, tl, env, tl, tl)
++DEF_HELPER_3(xd_radd16, tl, env, tl, tl)
++DEF_HELPER_3(xd_rsub16, tl, env, tl, tl)
++DEF_HELPER_3(xd_pk16, tl, env, tl, tl)
++DEF_HELPER_3(xd_gfmul4, tl, env, tl, tl)
++DEF_HELPER_2(xd_gf_cfg, void, env, tl)
++DEF_HELPER_1(xd_gf_rd, tl, env)
++DEF_HELPER_3(xd_mqmul2, tl, env, tl, tl)
++DEF_HELPER_3(xd_mqadd2, tl, env, tl, tl)
++DEF_HELPER_3(xd_mqsub2, tl, env, tl, tl)
++DEF_HELPER_3(xd_ctadd2, tl, env, tl, tl)
++DEF_HELPER_3(xd_ctsub2, tl, env, tl, tl)
++DEF_HELPER_3(xd_gsmul2, tl, env, tl, tl)
++DEF_HELPER_2(xd_mq_cfg, void, env, tl)
++DEF_HELPER_2(xd_mq_zeta, void, env, tl)
++DEF_HELPER_1(xd_mq_rd, tl, env)
++DEF_HELPER_1(xd_mq_rdz, tl, env)
++DEF_HELPER_3(xd_ar_set, void, env, i32, tl)
++DEF_HELPER_3(xd_ar_cfg, void, env, i32, tl)
++DEF_HELPER_3(xd_ar_mode, void, env, i32, tl)
++DEF_HELPER_2(xd_ar_rd, tl, env, i32)
++DEF_HELPER_2(xd_ar_rds, tl, env, i32)
++DEF_HELPER_2(xd_ar_rdm, tl, env, i32)
++DEF_HELPER_3(xd_ar_step, void, env, i32, i32)
++DEF_HELPER_3(xd_lp_setup, void, env, tl, tl)
++DEF_HELPER_2(xd_lp_set, void, env, tl)
++DEF_HELPER_2(xd_lp_sets, void, env, tl)
++DEF_HELPER_1(xd_lp_rd, tl, env)
++DEF_HELPER_1(xd_lp_rds, tl, env)
++DEF_HELPER_2(xd_loop_next, tl, env, tl)
+diff --git a/target/riscv/machine.c b/target/riscv/machine.c
+index 14a50f1..07582ae 100644
+--- a/target/riscv/machine.c
++++ b/target/riscv/machine.c
+@@ -498,6 +498,33 @@ static bool ssp_needed(void *opaque)
+     return cpu->cfg.ext_zicfiss;
+ }
+ 
++static bool xbrvdsp_needed(void *opaque)
++{
++    RISCVCPU *cpu = opaque;
++
++    return cpu->cfg.ext_xbrvdsp;
++}
++
++static const VMStateDescription vmstate_xbrvdsp = {
++    .name = "cpu/xbrvdsp",
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .needed = xbrvdsp_needed,
++    .fields = (const VMStateField[]) {
++        VMSTATE_INT64(env.xdsp_acc, RISCVCPU),
++        VMSTATE_UINT32_ARRAY(env.xdsp_ar_addr, RISCVCPU, 4),
++        VMSTATE_UINT16_ARRAY(env.xdsp_ar_stride, RISCVCPU, 4),
++        VMSTATE_UINT8_ARRAY(env.xdsp_ar_br, RISCVCPU, 4),
++        VMSTATE_UINT32(env.xdsp_lc, RISCVCPU),
++        VMSTATE_UINT32(env.xdsp_lp_start, RISCVCPU),
++        VMSTATE_UINT8(env.xdsp_gf_poly, RISCVCPU),
++        VMSTATE_UINT16(env.xdsp_mq_q, RISCVCPU),
++        VMSTATE_UINT16(env.xdsp_mq_qp, RISCVCPU),
++        VMSTATE_UINT16(env.xdsp_mq_zeta, RISCVCPU),
++        VMSTATE_END_OF_LIST()
++    }
++};
++
+ static const VMStateDescription vmstate_ssp = {
+     .name = "cpu/ssp",
+     .version_id = 2,
+@@ -632,6 +659,7 @@ const VMStateDescription vmstate_riscv_cpu = {
+         &vmstate_jvt,
+         &vmstate_elp,
+         &vmstate_ssp,
++        &vmstate_xbrvdsp,
+         &vmstate_ctr,
+         &vmstate_sstc,
+         &vmstate_mseccfg,
+diff --git a/target/riscv/meson.build b/target/riscv/meson.build
+index 42d0f6d..41a662c 100644
+--- a/target/riscv/meson.build
++++ b/target/riscv/meson.build
+@@ -6,6 +6,7 @@ gen = [
+   decodetree.process('XVentanaCondOps.decode', extra_args: '--static-decode=decode_XVentanaCodeOps'),
+   decodetree.process('xmips.decode', extra_args: '--static-decode=decode_xmips'),
+   decodetree.process('xlrbr.decode', extra_args: '--static-decode=decode_xlrbr'),
++  decodetree.process('xbrvdsp.decode', extra_args: '--static-decode=decode_xbrvdsp'),
+ ]
+ 
+ riscv_ss = ss.source_set()
+diff --git a/target/riscv/tcg/insn_trans/trans_xbrvdsp.c.inc b/target/riscv/tcg/insn_trans/trans_xbrvdsp.c.inc
+new file mode 100644
+index 0000000..783953e
+--- /dev/null
++++ b/target/riscv/tcg/insn_trans/trans_xbrvdsp.c.inc
+@@ -0,0 +1,216 @@
++/*
++ * RISC-V translation routines for Xbrvdsp, the DSP extension of the BRV32P
++ * core. The semantics are those of the core's Spike model
++ * (tools/spike_xbrvdsp/xbrvdsp.cc); the state and the arithmetic are in
++ * tcg/xbrvdsp_helper.c, the translator only picks the helper and moves the
++ * registers and the program counter.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++/* rd = f(rs1, rs2) */
++static bool gen_xd_rrd(DisasContext *ctx, arg_xdr *a,
++                       void (*fn)(TCGv, TCGv_env, TCGv, TCGv))
++{
++    TCGv dest = dest_gpr(ctx, a->rd);
++    TCGv src1 = get_gpr(ctx, a->rs1, EXT_NONE);
++    TCGv src2 = get_gpr(ctx, a->rs2, EXT_NONE);
++
++    fn(dest, tcg_env, src1, src2);
++    gen_set_gpr(ctx, a->rd, dest);
++    return true;
++}
++
++/* f(rs1, rs2), no register result */
++static bool gen_xd_rr(DisasContext *ctx, arg_xrr *a,
++                      void (*fn)(TCGv_env, TCGv, TCGv))
++{
++    fn(tcg_env, get_gpr(ctx, a->rs1, EXT_NONE), get_gpr(ctx, a->rs2, EXT_NONE));
++    return true;
++}
++
++/* f(rs1), no register result */
++static bool gen_xd_r(DisasContext *ctx, arg_xr *a, void (*fn)(TCGv_env, TCGv))
++{
++    fn(tcg_env, get_gpr(ctx, a->rs1, EXT_NONE));
++    return true;
++}
++
++/* rd = f(), a read of the unit's state */
++static bool gen_xd_d(DisasContext *ctx, arg_xd *a, void (*fn)(TCGv, TCGv_env))
++{
++    TCGv dest = dest_gpr(ctx, a->rd);
++
++    fn(dest, tcg_env);
++    gen_set_gpr(ctx, a->rd, dest);
++    return true;
++}
++
++/* rd = f(sh): acc.rd and acc.rdh, the shift is the rs2 field */
++static bool gen_xd_ds(DisasContext *ctx, arg_xds *a,
++                      void (*fn)(TCGv, TCGv_env, TCGv_i32))
++{
++    TCGv dest = dest_gpr(ctx, a->rd);
++
++    fn(dest, tcg_env, tcg_constant_i32(a->sh));
++    gen_set_gpr(ctx, a->rd, dest);
++    return true;
++}
++
++/*
++ * The last instruction of a hardware loop body: after it, the next pc is
++ * lp_start while the count is above 1, else the next instruction. The pc is
++ * only known at run time, so the translation block ends here.
++ */
++static bool gen_xd_loop_end(DisasContext *ctx)
++{
++    TCGv pc4 = tcg_temp_new();
++    TCGv next = tcg_temp_new();
++
++    gen_pc_plus_diff(pc4, ctx, 4);
++    gen_helper_xd_loop_next(next, tcg_env, pc4);
++    tcg_gen_mov_tl(cpu_pc, next);
++    lookup_and_goto_ptr(ctx);
++    ctx->base.is_jmp = DISAS_NORETURN;
++    return true;
++}
++
++#define TRANS_XD_RRD(NAME)                                              \
++    static bool trans_xd_##NAME(DisasContext *ctx, arg_xdr *a)         \
++    { return gen_xd_rrd(ctx, a, gen_helper_xd_##NAME); }
++#define TRANS_XD_RR(NAME)                                               \
++    static bool trans_xd_##NAME(DisasContext *ctx, arg_xrr *a)         \
++    { return gen_xd_rr(ctx, a, gen_helper_xd_##NAME); }
++#define TRANS_XD_R(NAME)                                                \
++    static bool trans_xd_##NAME(DisasContext *ctx, arg_xr *a)          \
++    { return gen_xd_r(ctx, a, gen_helper_xd_##NAME); }
++#define TRANS_XD_D(NAME)                                                \
++    static bool trans_xd_##NAME(DisasContext *ctx, arg_xd *a)          \
++    { return gen_xd_d(ctx, a, gen_helper_xd_##NAME); }
++#define TRANS_XD_DS(NAME)                                               \
++    static bool trans_xd_##NAME(DisasContext *ctx, arg_xds *a)         \
++    { return gen_xd_ds(ctx, a, gen_helper_xd_##NAME); }
++/* a multiply-accumulate that also ends a loop body */
++#define TRANS_XD_RR_LP(NAME)                                            \
++    static bool trans_xd_##NAME##_lp(DisasContext *ctx, arg_xrr *a)    \
++    {                                                                   \
++        gen_xd_rr(ctx, a, gen_helper_xd_##NAME);                        \
++        return gen_xd_loop_end(ctx);                                    \
++    }
++
++TRANS_XD_RR(mac)
++TRANS_XD_RR(dmac)
++TRANS_XD_RR(msu)
++TRANS_XD_RR_LP(mac)
++TRANS_XD_RR_LP(dmac)
++TRANS_XD_RR_LP(msu)
++TRANS_XD_R(acc_set)
++TRANS_XD_R(acc_seth)
++TRANS_XD_DS(acc_rd)
++TRANS_XD_DS(acc_rdh)
++TRANS_XD_D(acc_rdl)
++TRANS_XD_D(acc_rdx)
++TRANS_XD_RRD(sadd)
++TRANS_XD_RRD(ssub)
++TRANS_XD_RRD(radd16)
++TRANS_XD_RRD(rsub16)
++TRANS_XD_RRD(pk16)
++
++TRANS_XD_RRD(gfmul4)
++TRANS_XD_R(gf_cfg)
++TRANS_XD_D(gf_rd)
++
++TRANS_XD_RRD(mqmul2)
++TRANS_XD_RRD(mqadd2)
++TRANS_XD_RRD(mqsub2)
++TRANS_XD_RRD(ctadd2)
++TRANS_XD_RRD(ctsub2)
++TRANS_XD_RRD(gsmul2)
++TRANS_XD_R(mq_cfg)
++TRANS_XD_R(mq_zeta)
++TRANS_XD_D(mq_rd)
++TRANS_XD_D(mq_rdz)
++
++/* ar.set, ar.cfg, ar.mode: arN = rs1 */
++#define TRANS_XD_AR_W(NAME)                                             \
++    static bool trans_xd_##NAME(DisasContext *ctx, arg_xan *a)         \
++    {                                                                   \
++        gen_helper_xd_##NAME(tcg_env, tcg_constant_i32(a->n),           \
++                             get_gpr(ctx, a->rs1, EXT_NONE));           \
++        return true;                                                    \
++    }
++/* ar.rd, ar.rds, ar.rdm: rd = a field of arN */
++#define TRANS_XD_AR_R(NAME)                                             \
++    static bool trans_xd_##NAME(DisasContext *ctx, arg_xad *a)         \
++    {                                                                   \
++        TCGv dest = dest_gpr(ctx, a->rd);                               \
++                                                                        \
++        gen_helper_xd_##NAME(dest, tcg_env, tcg_constant_i32(a->n));    \
++        gen_set_gpr(ctx, a->rd, dest);                                  \
++        return true;                                                    \
++    }
++
++TRANS_XD_AR_W(ar_set)
++TRANS_XD_AR_W(ar_cfg)
++TRANS_XD_AR_W(ar_mode)
++TRANS_XD_AR_R(ar_rd)
++TRANS_XD_AR_R(ar_rds)
++TRANS_XD_AR_R(ar_rdm)
++
++/*
++ * lh.a, lw.a, lhu.a: rd = mem[addr of arN]; then addr steps by the stride. The
++ * load goes first, so that one that traps (misaligned) leaves the register
++ * as it was.
++ */
++static bool gen_xd_ar_load(DisasContext *ctx, arg_xad *a, MemOp memop,
++                           int size)
++{
++    TCGv dest = dest_gpr(ctx, a->rd);
++    TCGv addr = tcg_temp_new();
++
++    memop |= ctx->mo_endianness | MO_ALIGN;
++    decode_save_opc(ctx, 0);
++    tcg_gen_ld32u_tl(addr, tcg_env,
++                     offsetof(CPURISCVState, xdsp_ar_addr) +
++                     a->n * sizeof(uint32_t));
++    tcg_gen_qemu_ld_tl(dest, addr, ctx->mem_idx, memop);
++    gen_helper_xd_ar_step(tcg_env, tcg_constant_i32(a->n),
++                          tcg_constant_i32(size));
++    gen_set_gpr(ctx, a->rd, dest);
++    return true;
++}
++
++static bool trans_xd_lh_a(DisasContext *ctx, arg_xad *a)
++{
++    return gen_xd_ar_load(ctx, a, MO_SW, 2);
++}
++
++static bool trans_xd_lw_a(DisasContext *ctx, arg_xad *a)
++{
++    return gen_xd_ar_load(ctx, a, MO_SL, 4);
++}
++
++static bool trans_xd_lhu_a(DisasContext *ctx, arg_xad *a)
++{
++    return gen_xd_ar_load(ctx, a, MO_UW, 2);
++}
++
++/* lp.setup rs1: lc = rs1, and the body starts at the next instruction */
++static bool trans_xd_lp_setup(DisasContext *ctx, arg_xr *a)
++{
++    TCGv pc4 = tcg_temp_new();
++
++    gen_pc_plus_diff(pc4, ctx, 4);
++    gen_helper_xd_lp_setup(tcg_env, get_gpr(ctx, a->rs1, EXT_NONE), pc4);
++    return true;
++}
++
++static bool trans_xd_lp_end(DisasContext *ctx, arg_xd_lp_end *a)
++{
++    return gen_xd_loop_end(ctx);
++}
++
++TRANS_XD_R(lp_set)
++TRANS_XD_R(lp_sets)
++TRANS_XD_D(lp_rd)
++TRANS_XD_D(lp_rds)
+diff --git a/target/riscv/tcg/meson.build b/target/riscv/tcg/meson.build
+index a05ab64..aa515fb 100644
+--- a/target/riscv/tcg/meson.build
++++ b/target/riscv/tcg/meson.build
+@@ -15,6 +15,7 @@ riscv_ss.add(files(
+   'vcrypto_helper.c',
+   'vector_helper.c',
+   'vector_internals.c',
++  'xbrvdsp_helper.c',
+   'zce_helper.c'))
+ 
+ 
+diff --git a/target/riscv/tcg/translate.c b/target/riscv/tcg/translate.c
+index 9684dbe..d05a90f 100644
+--- a/target/riscv/tcg/translate.c
++++ b/target/riscv/tcg/translate.c
+@@ -1216,10 +1216,12 @@ static uint32_t opcode_at(DisasContextBase *dcbase, target_ulong pc)
+ #include "decode-xthead.c.inc"
+ #include "decode-xmips.c.inc"
+ #include "decode-xlrbr.c.inc"
++#include "decode-xbrvdsp.c.inc"
+ #include "insn_trans/trans_xthead.c.inc"
+ #include "insn_trans/trans_xventanacondops.c.inc"
+ #include "insn_trans/trans_xmips.c.inc"
+ #include "insn_trans/trans_xlrbr.c.inc"
++#include "insn_trans/trans_xbrvdsp.c.inc"
+ 
+ /* Include the auto-generated decoder for 16 bit insn */
+ #include "decode-insn16.c.inc"
+@@ -1240,6 +1242,7 @@ const RISCVDecoder decoder_table[] = {
+     { has_xthead_p, decode_xthead},
+     { has_XVentanaCondOps_p, decode_XVentanaCodeOps},
+     { has_xlrbr_p, decode_xlrbr},
++    { has_xbrvdsp_p, decode_xbrvdsp},
+ };
+ 
+ const size_t decoder_table_size = ARRAY_SIZE(decoder_table);
+diff --git a/target/riscv/tcg/xbrvdsp_helper.c b/target/riscv/tcg/xbrvdsp_helper.c
+new file mode 100644
+index 0000000..41f163e
+--- /dev/null
++++ b/target/riscv/tcg/xbrvdsp_helper.c
+@@ -0,0 +1,404 @@
++/*
++ * Xbrvdsp: the DSP extension of the BRV32P core. State and arithmetic.
++ *
++ * The semantics are those of the core's Spike model
++ * (tools/spike_xbrvdsp/xbrvdsp.cc), which the instructions are checked
++ * against one by one; the RTL (rtl/core/dsp_unit.v, agu.v, loop_unit.v,
++ * gf_unit.v, mq_unit.v) gives the same results.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "cpu.h"
++#include "exec/helper-proto.h"
++
++/* A 32-bit result as a register holds it */
++#define SEXT32(x) ((target_ulong)(int32_t)(x))
++
++static inline int64_t wrap40(int64_t v)       /* keep 40 bits, sign-extended */
++{
++    return (int64_t)((uint64_t)v << 24) >> 24;
++}
++
++static inline int64_t lo16(uint32_t r)
++{
++    return (int16_t)(r & 0xffff);
++}
++
++static inline int64_t hi16(uint32_t r)
++{
++    return (int16_t)((r >> 16) & 0xffff);
++}
++
++/* ---- the multiply-accumulate unit ---- */
++
++void HELPER(xd_mac)(CPURISCVState *env, target_ulong a, target_ulong b)
++{
++    env->xdsp_acc = wrap40(env->xdsp_acc + lo16(a) * lo16(b));
++}
++
++void HELPER(xd_dmac)(CPURISCVState *env, target_ulong a, target_ulong b)
++{
++    env->xdsp_acc = wrap40(env->xdsp_acc + lo16(a) * lo16(b) +
++                           hi16(a) * hi16(b));
++}
++
++void HELPER(xd_msu)(CPURISCVState *env, target_ulong a, target_ulong b)
++{
++    env->xdsp_acc = wrap40(env->xdsp_acc - lo16(a) * lo16(b));
++}
++
++void HELPER(xd_acc_set)(CPURISCVState *env, target_ulong a)
++{
++    env->xdsp_acc = (int32_t)a;
++}
++
++void HELPER(xd_acc_seth)(CPURISCVState *env, target_ulong a)
++{
++    env->xdsp_acc = wrap40((env->xdsp_acc & 0xffffffffLL) |
++                           ((int64_t)(a & 0xff) << 32));
++}
++
++/* (acc + 2^(sh-1)) >> sh, the rounding being 0 for sh = 0 */
++static int64_t acc_rounded_shift(CPURISCVState *env, uint32_t sh)
++{
++    int64_t v = env->xdsp_acc + (sh ? ((int64_t)1 << (sh - 1)) : 0);
++
++    return v >> sh;
++}
++
++target_ulong HELPER(xd_acc_rd)(CPURISCVState *env, uint32_t sh)
++{
++    int64_t v = acc_rounded_shift(env, sh);
++
++    if (v > INT32_MAX) {
++        v = INT32_MAX;
++    }
++    if (v < INT32_MIN) {
++        v = INT32_MIN;
++    }
++    return SEXT32(v);
++}
++
++target_ulong HELPER(xd_acc_rdh)(CPURISCVState *env, uint32_t sh)
++{
++    int64_t v = acc_rounded_shift(env, sh);
++
++    if (v > INT16_MAX) {
++        v = INT16_MAX;
++    }
++    if (v < INT16_MIN) {
++        v = INT16_MIN;
++    }
++    return SEXT32(v);
++}
++
++target_ulong HELPER(xd_acc_rdl)(CPURISCVState *env)
++{
++    return SEXT32(env->xdsp_acc & 0xffffffff);
++}
++
++target_ulong HELPER(xd_acc_rdx)(CPURISCVState *env)
++{
++    return SEXT32(env->xdsp_acc >> 32);
++}
++
++/* ---- saturating and packed arithmetic ---- */
++
++static target_ulong sat32(int64_t v)
++{
++    if (v > INT32_MAX) {
++        v = INT32_MAX;
++    }
++    if (v < INT32_MIN) {
++        v = INT32_MIN;
++    }
++    return SEXT32(v);
++}
++
++target_ulong HELPER(xd_sadd)(CPURISCVState *env, target_ulong a, target_ulong b)
++{
++    return sat32((int64_t)(int32_t)a + (int32_t)b);
++}
++
++target_ulong HELPER(xd_ssub)(CPURISCVState *env, target_ulong a, target_ulong b)
++{
++    return sat32((int64_t)(int32_t)a - (int32_t)b);
++}
++
++/* per 16-bit half, (a +- b) >> 1, signed */
++static target_ulong halves(uint32_t a, uint32_t b, bool sub)
++{
++    int32_t lo = sub ? lo16(a) - lo16(b) : lo16(a) + lo16(b);
++    int32_t hi = sub ? hi16(a) - hi16(b) : hi16(a) + hi16(b);
++
++    return SEXT32(((uint32_t)(hi >> 1) << 16) | ((uint32_t)(lo >> 1) & 0xffff));
++}
++
++target_ulong HELPER(xd_radd16)(CPURISCVState *env, target_ulong a, target_ulong b)
++{
++    return halves(a, b, false);
++}
++
++target_ulong HELPER(xd_rsub16)(CPURISCVState *env, target_ulong a, target_ulong b)
++{
++    return halves(a, b, true);
++}
++
++target_ulong HELPER(xd_pk16)(CPURISCVState *env, target_ulong a, target_ulong b)
++{
++    return SEXT32(((uint32_t)(a & 0xffff) << 16) | (b & 0xffff));
++}
++
++/* ---- GF(2^8), modulo x^8 + poly ---- */
++
++static uint8_t gf_mul(uint8_t poly, uint8_t a, uint8_t b)
++{
++    uint8_t r = 0;
++
++    for (int k = 7; k >= 0; k--) {
++        r = (uint8_t)((r << 1) ^ (r & 0x80 ? poly : 0));
++        if (b & (1u << k)) {
++            r ^= a;
++        }
++    }
++    return r;
++}
++
++target_ulong HELPER(xd_gfmul4)(CPURISCVState *env, target_ulong a, target_ulong b)
++{
++    uint32_t r = 0;
++
++    for (int i = 0; i < 32; i += 8) {
++        r |= (uint32_t)gf_mul(env->xdsp_gf_poly, (uint8_t)(a >> i),
++                              (uint8_t)(b >> i)) << i;
++    }
++    return SEXT32(r);
++}
++
++void HELPER(xd_gf_cfg)(CPURISCVState *env, target_ulong a)
++{
++    env->xdsp_gf_poly = (uint8_t)a;
++}
++
++target_ulong HELPER(xd_gf_rd)(CPURISCVState *env)
++{
++    return env->xdsp_gf_poly;
++}
++
++/* ---- two 16-bit lanes of arithmetic mod q, Montgomery with R = 2^16 ---- */
++
++static uint16_t mq_mont(CPURISCVState *env, uint32_t p)
++{
++    uint32_t m = (uint16_t)(p * env->xdsp_mq_qp);
++    uint64_t t = ((uint64_t)p + (uint64_t)m * env->xdsp_mq_q) >> 16;
++
++    return (uint16_t)(t >= env->xdsp_mq_q ? t - env->xdsp_mq_q : t);
++}
++
++static uint16_t mq_add(CPURISCVState *env, uint16_t a, uint16_t b)
++{
++    uint32_t s = (uint32_t)a + b;
++
++    return (uint16_t)(s >= env->xdsp_mq_q ? s - env->xdsp_mq_q : s);
++}
++
++static uint16_t mq_sub(CPURISCVState *env, uint16_t a, uint16_t b)
++{
++    return (uint16_t)(a >= b ? a - b : a - b + env->xdsp_mq_q);
++}
++
++enum { MQ_MUL, MQ_ADD, MQ_SUB, MQ_CTADD, MQ_CTSUB, MQ_GSMUL };
++
++static target_ulong mq_lanes(CPURISCVState *env, int f, uint32_t a, uint32_t b)
++{
++    uint32_t r = 0;
++
++    for (int i = 0; i < 32; i += 16) {
++        uint16_t x = (uint16_t)(a >> i), y = (uint16_t)(b >> i), v;
++
++        switch (f) {
++        case MQ_MUL:
++            v = mq_mont(env, (uint32_t)x * y);
++            break;
++        case MQ_ADD:
++            v = mq_add(env, x, y);
++            break;
++        case MQ_SUB:
++            v = mq_sub(env, x, y);
++            break;
++        case MQ_CTADD:
++            v = mq_add(env, x, mq_mont(env, (uint32_t)env->xdsp_mq_zeta * y));
++            break;
++        case MQ_CTSUB:
++            v = mq_sub(env, x, mq_mont(env, (uint32_t)env->xdsp_mq_zeta * y));
++            break;
++        default:
++            v = mq_mont(env, (uint32_t)env->xdsp_mq_zeta * mq_sub(env, y, x));
++            break;
++        }
++        r |= (uint32_t)v << i;
++    }
++    return SEXT32(r);
++}
++
++target_ulong HELPER(xd_mqmul2)(CPURISCVState *env, target_ulong a, target_ulong b)
++{
++    return mq_lanes(env, MQ_MUL, a, b);
++}
++
++target_ulong HELPER(xd_mqadd2)(CPURISCVState *env, target_ulong a, target_ulong b)
++{
++    return mq_lanes(env, MQ_ADD, a, b);
++}
++
++target_ulong HELPER(xd_mqsub2)(CPURISCVState *env, target_ulong a, target_ulong b)
++{
++    return mq_lanes(env, MQ_SUB, a, b);
++}
++
++target_ulong HELPER(xd_ctadd2)(CPURISCVState *env, target_ulong a, target_ulong b)
++{
++    return mq_lanes(env, MQ_CTADD, a, b);
++}
++
++target_ulong HELPER(xd_ctsub2)(CPURISCVState *env, target_ulong a, target_ulong b)
++{
++    return mq_lanes(env, MQ_CTSUB, a, b);
++}
++
++target_ulong HELPER(xd_gsmul2)(CPURISCVState *env, target_ulong a, target_ulong b)
++{
++    return mq_lanes(env, MQ_GSMUL, a, b);
++}
++
++/* q = a[15:0], qp = a[31:16], and zeta goes back to 0 */
++void HELPER(xd_mq_cfg)(CPURISCVState *env, target_ulong a)
++{
++    env->xdsp_mq_q = (uint16_t)a;
++    env->xdsp_mq_qp = (uint16_t)((uint32_t)a >> 16);
++    env->xdsp_mq_zeta = 0;
++}
++
++void HELPER(xd_mq_zeta)(CPURISCVState *env, target_ulong a)
++{
++    env->xdsp_mq_zeta = (uint16_t)a;
++}
++
++target_ulong HELPER(xd_mq_rd)(CPURISCVState *env)
++{
++    return SEXT32((uint32_t)env->xdsp_mq_qp << 16 | env->xdsp_mq_q);
++}
++
++target_ulong HELPER(xd_mq_rdz)(CPURISCVState *env)
++{
++    return env->xdsp_mq_zeta;
++}
++
++/* ---- the address registers ---- */
++
++void HELPER(xd_ar_set)(CPURISCVState *env, uint32_t n, target_ulong a)
++{
++    env->xdsp_ar_addr[n & 3] = a;
++}
++
++void HELPER(xd_ar_cfg)(CPURISCVState *env, uint32_t n, target_ulong a)
++{
++    env->xdsp_ar_stride[n & 3] = (uint16_t)a;
++}
++
++void HELPER(xd_ar_mode)(CPURISCVState *env, uint32_t n, target_ulong a)
++{
++    env->xdsp_ar_br[n & 3] = a & 1;
++}
++
++target_ulong HELPER(xd_ar_rd)(CPURISCVState *env, uint32_t n)
++{
++    return SEXT32(env->xdsp_ar_addr[n & 3]);
++}
++
++target_ulong HELPER(xd_ar_rds)(CPURISCVState *env, uint32_t n)
++{
++    return SEXT32((int32_t)(int16_t)env->xdsp_ar_stride[n & 3]);
++}
++
++target_ulong HELPER(xd_ar_rdm)(CPURISCVState *env, uint32_t n)
++{
++    return env->xdsp_ar_br[n & 3] ? 1 : 0;
++}
++
++static uint16_t rev16(uint16_t v)
++{
++    uint16_t r = 0;
++
++    for (int k = 0; k < 16; k++) {
++        if (v & (1u << k)) {
++            r |= 1u << (15 - k);
++        }
++    }
++    return r;
++}
++
++/*
++ * Step address register n after a load of `size` bytes. In bit-reversed mode
++ * the low 16 bits take a reverse-carry addition, which carries from the high
++ * bits to the low ones and stops at the element size.
++ */
++void HELPER(xd_ar_step)(CPURISCVState *env, uint32_t n, uint32_t size)
++{
++    n &= 3;
++    if (env->xdsp_ar_br[n]) {
++        uint16_t lo = rev16((uint16_t)(rev16(env->xdsp_ar_addr[n] & 0xffff) +
++                                       rev16(env->xdsp_ar_stride[n])));
++        uint16_t below = (uint16_t)(size - 1);
++
++        lo = (uint16_t)((lo & ~below) | (env->xdsp_ar_addr[n] & below));
++        env->xdsp_ar_addr[n] = (env->xdsp_ar_addr[n] & 0xffff0000u) | lo;
++    } else {
++        env->xdsp_ar_addr[n] += (uint32_t)(int32_t)(int16_t)env->xdsp_ar_stride[n];
++    }
++}
++
++/* ---- the hardware loop ---- */
++
++void HELPER(xd_lp_setup)(CPURISCVState *env, target_ulong a, target_ulong pc4)
++{
++    env->xdsp_lc = (uint32_t)a;
++    env->xdsp_lp_start = (uint32_t)pc4;
++}
++
++void HELPER(xd_lp_set)(CPURISCVState *env, target_ulong a)
++{
++    env->xdsp_lc = (uint32_t)a;
++}
++
++void HELPER(xd_lp_sets)(CPURISCVState *env, target_ulong a)
++{
++    env->xdsp_lp_start = (uint32_t)a;
++}
++
++target_ulong HELPER(xd_lp_rd)(CPURISCVState *env)
++{
++    return SEXT32(env->xdsp_lc);
++}
++
++target_ulong HELPER(xd_lp_rds)(CPURISCVState *env)
++{
++    return SEXT32(env->xdsp_lp_start);
++}
++
++/*
++ * After the last instruction of a loop body: while lc > 1, count down and go
++ * to lp_start; else lc becomes 0 and execution falls through to pc4. A loop
++ * set up with a count n runs its body n times (once for n = 0 or 1).
++ */
++target_ulong HELPER(xd_loop_next)(CPURISCVState *env, target_ulong pc4)
++{
++    if (env->xdsp_lc > 1) {
++        env->xdsp_lc--;
++        return SEXT32(env->xdsp_lp_start);
++    }
++    env->xdsp_lc = 0;
++    return pc4;
++}
+diff --git a/target/riscv/xbrvdsp.decode b/target/riscv/xbrvdsp.decode
+new file mode 100644
+index 0000000..f199517
+--- /dev/null
++++ b/target/riscv/xbrvdsp.decode
+@@ -0,0 +1,92 @@
++#
++# Translation routines for the instructions of Xbrvdsp, the DSP extension of
++# the BRV32P core: the multiply-accumulate unit, the address registers and the
++# hardware loop (custom-0 and custom-1), the packed GF(2^8) multiply and the
++# packed arithmetic mod q (custom-0, funct3 101 and 110).
++#
++# The encodings are those of the core's decoder (rtl/core/decoder.v) and of its
++# Spike model (tools/spike_xbrvdsp/xbrvdsp.cc). A field the RTL requires to be
++# zero is fixed to zero here, so that the same words are illegal.
++#
++# SPDX-License-Identifier: GPL-2.0-or-later
++
++# Fields:
++%rs1       15:5
++%rs2       20:5
++%rd         7:5
++%arn_set    7:2          # the address register of ar.set, ar.cfg, ar.mode: rd[1:0]
++%arn_imm   20:2          # ... of the loads and ar.rd, ar.rds, ar.rdm: imm[1:0]
++
++# Argument sets:
++&xrr       rs1 rs2       # two sources, no result
++&xr        rs1           # one source, no result
++&xd        rd            # a result from the unit's state
++&xdr       rd rs1 rs2
++&xds       rd sh         # a result, shifted by the rs2 field
++&xan       n rs1         # address register n, one source
++&xad       rd n          # a result from (or a load through) address register n
++
++# Formats 32:
++@rr        ....... ..... ..... ... ..... ....... &xrr %rs1 %rs2
++@r1        ....... ..... ..... ... ..... ....... &xr %rs1
++@d         ....... ..... ..... ... ..... ....... &xd %rd
++@rrd       ....... ..... ..... ... ..... ....... &xdr %rd %rs1 %rs2
++@rd_sh     ....... ..... ..... ... ..... ....... &xds %rd sh=%rs2
++@ar_w      ....... ..... ..... ... ..... ....... &xan n=%arn_set %rs1
++@ar_ld     ....... ..... ..... ... ..... ....... &xad %rd n=%arn_imm
++
++# *** custom-0: accumulator, saturating and packed arithmetic ***
++# funct7 bit 6 (insn bit 31) marks the last instruction of a hardware loop body
++xd_mac       0000000 ..... ..... 000 00000 0001011 @rr
++xd_dmac      0000001 ..... ..... 000 00000 0001011 @rr
++xd_msu       0000010 ..... ..... 000 00000 0001011 @rr
++xd_mac_lp    1000000 ..... ..... 000 00000 0001011 @rr
++xd_dmac_lp   1000001 ..... ..... 000 00000 0001011 @rr
++xd_msu_lp    1000010 ..... ..... 000 00000 0001011 @rr
++xd_acc_set   0000100 00000 ..... 000 00000 0001011 @r1
++xd_acc_seth  0000101 00000 ..... 000 00000 0001011 @r1
++xd_acc_rd    0000000 ..... 00000 001 ..... 0001011 @rd_sh
++xd_acc_rdh   0000000 ..... 00000 010 ..... 0001011 @rd_sh
++xd_acc_rdl   0000000 00000 00000 011 ..... 0001011 @d
++xd_acc_rdx   0000001 00000 00000 011 ..... 0001011 @d
++xd_sadd      0000000 ..... ..... 100 ..... 0001011 @rrd
++xd_ssub      0000001 ..... ..... 100 ..... 0001011 @rrd
++xd_radd16    0000010 ..... ..... 100 ..... 0001011 @rrd
++xd_rsub16    0000011 ..... ..... 100 ..... 0001011 @rrd
++xd_pk16      0000100 ..... ..... 100 ..... 0001011 @rrd
++
++# *** custom-0: GF(2^8) ***
++xd_gfmul4    0000000 ..... ..... 101 ..... 0001011 @rrd
++xd_gf_cfg    0000001 00000 ..... 101 00000 0001011 @r1
++xd_gf_rd     0000010 00000 00000 101 ..... 0001011 @d
++
++# *** custom-0: arithmetic mod q ***
++xd_mqmul2    0000000 ..... ..... 110 ..... 0001011 @rrd
++xd_mqadd2    0000001 ..... ..... 110 ..... 0001011 @rrd
++xd_mqsub2    0000010 ..... ..... 110 ..... 0001011 @rrd
++xd_ctadd2    0000011 ..... ..... 110 ..... 0001011 @rrd
++xd_ctsub2    0000100 ..... ..... 110 ..... 0001011 @rrd
++xd_gsmul2    0001001 ..... ..... 110 ..... 0001011 @rrd
++xd_mq_cfg    0000101 00000 ..... 110 00000 0001011 @r1
++xd_mq_zeta   0000110 00000 ..... 110 00000 0001011 @r1
++xd_mq_rd     0000111 00000 00000 110 ..... 0001011 @d
++xd_mq_rdz    0001000 00000 00000 110 ..... 0001011 @d
++
++# *** custom-1: address registers ***
++xd_ar_set    0000000 00000 ..... 000 000.. 0101011 @ar_w
++xd_ar_cfg    0000001 00000 ..... 000 000.. 0101011 @ar_w
++xd_ar_mode   0000011 00000 ..... 000 000.. 0101011 @ar_w
++xd_lh_a      0000000 000.. 00000 001 ..... 0101011 @ar_ld
++xd_lw_a      0000000 000.. 00000 010 ..... 0101011 @ar_ld
++xd_lhu_a     0000000 000.. 00000 101 ..... 0101011 @ar_ld
++xd_ar_rd     0000000 000.. 00000 011 ..... 0101011 @ar_ld
++xd_ar_rds    0000000 001.. 00000 011 ..... 0101011 @ar_ld
++xd_ar_rdm    0000000 011.. 00000 011 ..... 0101011 @ar_ld
++
++# *** custom-1: hardware loop ***
++xd_lp_setup  0000000 00000 ..... 110 00000 0101011 @r1
++xd_lp_end    0000000 00000 00000 111 00000 0101011
++xd_lp_set    0000010 00000 ..... 000 00000 0101011 @r1
++xd_lp_sets   0000010 00000 ..... 000 00001 0101011 @r1
++xd_lp_rd     0000000 01000 00000 011 ..... 0101011 @d
++xd_lp_rds    0000000 01001 00000 011 ..... 0101011 @d

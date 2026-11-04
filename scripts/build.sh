@@ -7,7 +7,7 @@
 #        SRC    where the QEMU sources are fetched (default .cache/qemu-src)
 #        BUILD  the build tree (default build/qemu)
 # The release tag is read from QEMU_VERSION, the one place it is pinned.
-# Result: $BUILD/qemu-system-riscv32
+# Result: $BUILD/qemu-system-riscv32, and the TCG plugin $BUILD/contrib/plugins/libexeclog.so
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -49,6 +49,8 @@ cd "$BUILD"
   --disable-spice --disable-libusb --disable-selinux --disable-numa \
   --disable-pa --disable-alsa --disable-jack --disable-oss --disable-pipewire \
   --disable-sndio --disable-dbus-display --disable-rust \
+  --enable-plugins \
   --disable-werror
-make -j"$JOBS" qemu-system-riscv32
-echo "built: $BUILD/qemu-system-riscv32"
+# The execlog plugin is the instruction trace tests/run_lockstep.sh compares with Spike
+make -j"$JOBS" qemu-system-riscv32 contrib-plugins
+echo "built: $BUILD/qemu-system-riscv32 and $BUILD/contrib/plugins/libexeclog.so"

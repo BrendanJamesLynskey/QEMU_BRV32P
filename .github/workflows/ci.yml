@@ -1,6 +1,8 @@
 # CI: build QEMU at the pinned release with the patch series, then run the
 # BRV32P tests on it: the core repo's ISA tests, the SoC firmware, and the
-# machine tests.
+# machine tests. Then build Spike with the core repo's model of the custom
+# extensions and run the custom-instruction tests on both, instruction by
+# instruction (tests/run_lockstep.sh).
 name: CI
 
 on:
@@ -10,6 +12,7 @@ on:
 env:
   CORE_REPO_URL: BrendanJamesLynskey/RISCV_RV32IMC_5stage
   RISCV_TESTS_REV: 3df703cd52d5f0d8224e3c50bf03c6cb70efff98    # riscv-tests, as the core repo's CI
+  SPIKE_REV: fb225a5f5e50d889305b8ef6e53c2b66d9e765f7          # riscv-isa-sim, as the core repo's CI
 
 jobs:
   test:
@@ -22,7 +25,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-riscv64-unknown-elf ninja-build pkg-config \
-            libglib2.0-dev libpixman-1-dev python3-venv python3-pip ccache
+            libglib2.0-dev libpixman-1-dev python3-venv python3-pip ccache device-tree-compiler
 
       - name: Core repo (RTL tests, firmware generator, env and linker script)
         uses: actions/checkout@v4
@@ -34,7 +37,9 @@ jobs:
         id: qemu-cache
         uses: actions/cache@v4
         with:
-          path: build/qemu/qemu-system-riscv32
+          path: |
+            build/qemu/qemu-system-riscv32
+            build/qemu/contrib/plugins/libexeclog.so
           key: qemu-${{ hashFiles('QEMU_VERSION', 'patches/*.patch', 'scripts/build.sh') }}
 
       - name: Build QEMU (pinned release plus patches)
@@ -46,6 +51,7 @@ jobs:
           build/qemu/qemu-system-riscv32 --version
           build/qemu/qemu-system-riscv32 -M help | grep brv32p
           build/qemu/qemu-system-riscv32 -cpu help | grep brv32p
+          test -f build/qemu/contrib/plugins/libexeclog.so
 
       - name: ISA tests (riscv-tests and the core repo's directed tests) and rv32mi
         run: |
@@ -58,6 +64,41 @@ jobs:
       - name: Machine tests (SoC firmware, timer, UART, GPIO)
         run: CORE_REPO="$PWD/core" RISCV_TESTS="$PWD/core/tests/isa/riscv-tests" tests/run_machine.py
 
+      - name: Restore Spike
+        id: spike-cache
+        if: ${{ !cancelled() && hashFiles('build/qemu/qemu-system-riscv32') != '' }}
+        uses: actions/cache@v4
+        with:
+          path: ~/spike
+          key: spike-${{ env.SPIKE_REV }}-ubuntu-24.04-with-headers
+
+      - name: Build Spike
+        if: ${{ !cancelled() && hashFiles('build/qemu/qemu-system-riscv32') != '' && steps.spike-cache.outputs.cache-hit != 'true' }}
+        run: |
+          git clone https://github.com/riscv-software-src/riscv-isa-sim.git /tmp/spike-src
+          cd /tmp/spike-src
+          git checkout "$SPIKE_REV"
+          git submodule update --init --depth 1
+          mkdir build && cd build
+          ../configure --prefix="$HOME/spike" --with-boost=no
+          make -j"$(nproc)"
+          make install
+          # Keep the source and generated headers: the core repo's model of the
+          # custom extensions compiles against them (tools/spike_xbrvdsp/build.sh)
+          mkdir -p "$HOME/spike/src/build"
+          cp -rL ../riscv ../fesvr ../softfloat ../fdt "$HOME/spike/src/"   # -L: softfloat links into its submodule
+          cp config.h insn_list.h "$HOME/spike/src/build/"
+
+      - name: Build the Spike model of the custom extensions (libxbrvdsp.so, from the core repo)
+        if: ${{ !cancelled() && hashFiles('build/qemu/qemu-system-riscv32') != '' }}
+        run: core/tools/spike_xbrvdsp/build.sh "$HOME/spike/src" "$HOME/spike/src/build" "$PWD/build/xbrvdsp"
+
+      - name: Lockstep with Spike (custom-instruction tests, QEMU's execlog against Spike's commit log)
+        if: ${{ !cancelled() && hashFiles('build/qemu/qemu-system-riscv32') != '' }}
+        run: |
+          export CORE_REPO="$PWD/core" RISCV_TESTS="$PWD/core/tests/isa/riscv-tests"
+          SPIKE="$HOME/spike/bin/spike" XBRVDSP_LIB="$PWD/build/xbrvdsp/libxbrvdsp.so" tests/run_lockstep.sh
+
       - name: Short report
         if: always()
         run: |
@@ -65,8 +106,8 @@ jobs:
             echo "## BRV32P QEMU model"
             echo "QEMU $(cat QEMU_VERSION) plus $(ls patches/*.patch | wc -l) patches"
             echo '```'
-            grep -h -E "^suite|passed" tests/build/isa/results.txt tests/build/machine/results.txt || true
-            grep -h -E "FAIL|BUILD" tests/build/isa/results.txt tests/build/machine/results.txt || true
+            grep -h -E "^suite|passed" tests/build/isa/results.txt tests/build/machine/results.txt tests/build/lockstep/results.txt || true
+            grep -h -E "FAIL|BUILD|MISMATCH" tests/build/isa/results.txt tests/build/machine/results.txt tests/build/lockstep/results.txt || true
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY" > tests/build/report.md
 
@@ -79,3 +120,7 @@ jobs:
             tests/build/report.md
             tests/build/isa/results.txt
             tests/build/machine/results.txt
+            tests/build/lockstep/results.txt
+            tests/build/lockstep/*.S
+            tests/build/lockstep/*.qemu
+            tests/build/lockstep/*.spike

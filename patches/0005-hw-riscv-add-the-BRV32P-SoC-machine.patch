@@ -1,7 +1,7 @@
-From 806d64b8842dfcd1abe6aac112fcfead09c722b5 Mon Sep 17 00:00:00 2001
+From 6d34cf48810a515f91811c0e1e75853ae150199f Mon Sep 17 00:00:00 2001
 From: Brendan Lynskey <brendanlynskey@googlemail.com>
 Date: Tue, 3 Nov 2026 01:17:59 +0000
-Subject: [PATCH 5/6] hw/riscv: add the BRV32P SoC machine
+Subject: [PATCH 5/7] hw/riscv: add the BRV32P SoC machine
 
 A machine that models the BRV32P SoC: one RV32IMC hart in machine mode, a
 32 KB SRAM, and the GPIO, UART and timer at 0x20000000, 0x20000100 and

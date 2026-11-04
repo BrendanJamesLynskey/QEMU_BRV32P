@@ -100,7 +100,7 @@ for ent in "${PROGRAMS[@]}"; do
   trace=1; [[ "$NO_TRACE" == *" $name "* ]] && trace=0
   ignore=""
   # The firmware reads mcycle once, which differs by design
-  [ "$name" = firmware ] && ignore="0x$(awk '/csrr.*mcycle|csrrs.*0xb00/ { sub(":", "", $1); print $1; exit }' "$out.dis")"
+  [ "$name" = firmware ] && ignore="$(tr '\n' ' ' < "$B/firmware.S.ignore")"
   printf 'tohost=%s\nspike=%s\ntrace=%s\nignore=%s\nsrc=%s\n' "$tohost" "$spike" "$trace" "$ignore" "$srclabel" > "$out.meta"
   echo "$name" >> "$B/programs.txt"
   built+=("$name")

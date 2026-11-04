@@ -33,3 +33,10 @@ out += ["  li s11, 1", "  la s10, tohost", "  sw s11, 0(s10)", "1: j 1b",
         "", '  .section .tohost, "aw", @progbits', "  .align 6", "  .globl tohost", "tohost: .dword 0",
         "  .align 6", "  .globl fromhost", "fromhost: .dword 0", ""]
 open(sys.argv[2], "w").write("\n".join(out))
+
+# The pcs whose result differs by design between platforms: a read of mcycle or minstret
+# (csrrs rd, 0xB00 / 0xB02, x0); the runner tells the comparer to skip the value there
+with open(sys.argv[2] + ".ignore", "w") as f:
+    for i, w in enumerate(words[:cut]):
+        if w & 0xFFFFF07F in (0xB0002073, 0xB0202073):
+            f.write(f"0x{0x80000000 + 4 * i:08x}\n")

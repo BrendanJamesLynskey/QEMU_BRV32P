@@ -58,8 +58,8 @@ timer and checks itself in the ISA run) and 5 randomised operand tests written b
 | rand_agu | 3,566 | 1,232 |
 | rand_loop | 8,411 | 5,107 |
 
-Every custom instruction (all 45 encodings) is compared at least 3 times in the directed tests and 88 to 12,000
-times in the random ones.
+Every custom instruction (all 45 encodings) is compared in the random tests: the configuration reads and writes
+`mq.cfg`, `mq.rd`, `gf.cfg` and `gf.rd` 9 to 13 times (one per configuration), every other one 54 to 36,000 times.
 
 ## CI
 

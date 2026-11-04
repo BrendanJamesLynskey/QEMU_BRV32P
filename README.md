@@ -14,7 +14,7 @@ The repo is a **patch series against a pinned QEMU release**, not a QEMU tree. T
 |---|---|---|
 | Q0 | [design note](docs/design.md), taken from the RTL | PR `q0-design` |
 | Q1 | the machine, the three peripherals, ELF loading with `tohost` exit; tests and CI | PR `q1-machine` |
-| Q2 | the custom extensions (Xbrvdsp, GF, mod-q) by decodetree, checked against the Spike library | PR `q2-extensions` |
+| Q2 | the custom extensions (Xbrvdsp, GF, mod-q) by decodetree, checked against the Spike library | PR `q2-extensions`: patch 0007, 126 ISA tests run, 11 in lockstep with Spike |
 | Q3 | one ELF on QEMU, Spike and RTL in CI | outlined in the design note |
 
 ## Build and run
@@ -54,11 +54,19 @@ The GPIO pins are the QOM properties `gpio-in` (writable) and `gpio-out` of `/ma
 for its env, linker script, directed tests and firmware generator, and `riscv64-unknown-elf-gcc`. They write
 `tests/build/*/results.txt`.
 
+`tests/run_lockstep.sh` also needs Spike (`SPIKE`, built at the revision the core repo's CI pins) and the core
+repo's `libxbrvdsp.so` (`XBRVDSP_LIB`, from `tools/spike_xbrvdsp/build.sh`), and the `execlog` plugin that
+`scripts/build.sh` builds with QEMU. It runs the custom-instruction tests on both simulators and compares them
+instruction by instruction (pc, encoding, register written); a mismatch fails the test.
+
 ## Results
 
-On QEMU `v11.1.3` plus the patches: 118 / 118 of the ISA tests run (rv32ui 41, rv32um 8, rv32uc 1, rv32ui-c 40,
-rv32um-c 8, the core repo's directed tests without custom instructions 6, rv32mi 14), and 4 / 4 of the machine
-tests (SoC firmware, timer, UART, GPIO). The 12 tests not run are listed with their reasons in
+On QEMU `v11.1.3` plus the seven patches (core repo at `bc75bf8`): 126 / 126 of the ISA tests run (rv32ui 41,
+rv32um 8, rv32uc 1, rv32ui-c 40, rv32um-c 8, rv32mi 14, and the core repo's 14 directed tests: the 6 without
+custom instructions, the 7 that use Xbrvdsp, GF or mod-q, and `periph_uncached`, added to the core repo after
+Q1), 4 / 4 of the machine tests (SoC firmware, timer, UART, GPIO), and 11 / 11 of the lockstep tests against
+Spike (the 6 directed tests Spike can run, and 5 randomised operand tests; 362,689 instructions compared,
+79,100 of them custom). The 5 ISA tests not run are listed with their reasons in
 [`tests/run_isa.sh`](tests/run_isa.sh).
 
 ## Licence

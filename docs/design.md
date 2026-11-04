@@ -5,7 +5,8 @@ to that repo at the revision this note was written against (`c9c2c9f`); `rtl/` p
 
 The aim is a QEMU machine, `-M brv32p`, that models the SoC closely enough for the same binaries to run on it
 as on the RTL. There is no Linux and no MMU. Spike remains the ISA reference and the RTL the timing
-reference. The custom extensions (Xbrvdsp, GF(2^8), mod-q) are step Q2 and are not covered here.
+reference. The custom extensions (Xbrvdsp, GF(2^8), mod-q) are step Q2: not covered in sections 1 to 6, see
+sections 9 and 10.
 
 ## 1. Memory map
 
@@ -225,7 +226,8 @@ Alternatives considered:
 Modelled:
 
 * one RV32IMC hart in machine mode with Zicsr, Zifencei and Zbkb, Zbkc, Zbkx, Zknd, Zkne, Zknh (the `-march`
-  of the benches, `tests/bench/run_bench.sh:18-19`); a new CPU type `brv32p`;
+  of the benches, `tests/bench/run_bench.sh:18-19`); a new CPU type `brv32p`; the custom extensions of step Q2
+  (section 9) are on this CPU too;
 * misaligned loads and stores trap, as the core does (an internal CPU option);
 * the SRAM at 0x0000_0000 with an alias at 0x8000_0000 (the two addresses the RTL is used at);
 * the GPIO, UART and timer register-exact, including single-word bus accesses, the repeats inside the
@@ -363,7 +365,14 @@ loop body that runs into the interrupt of a peripheral that is not modelled.
 Reading the RTL against the Spike model (decode masks, reset values, rounding and saturation, the
 bit-reversed step, the loop count, the mod-q reductions, `lp.rd` and `lp.rds`) found none: the two agree, and the
 core repo's own lockstep (RTL against Spike) agrees with that. The differences between the model and the RTL
-are timing only (a QEMU instruction is one unit of time; the RTL's `mqmul2` takes two cycles in MEM) and are not observable to a program, other than through `mcycle`.
+are timing only (a QEMU instruction is one unit of time; the RTL's `mqmul2` takes two cycles in MEM) and are not
+observable to a program, other than through `mcycle`.
+
+One timing difference does show in a test. The core repo's `periph_uncached`, added with the D-cache fix (core PR
+#30, after Q1), needs two back-to-back reads of the timer count to differ. The RTL's loads take several cycles;
+the model's take one instruction, 8 ns at `-icount shift=3`, against a 10 ns timer tick, so the two reads can
+fall in the same tick, and did in some CI runs and not others. `tests/run_isa.sh` runs that one test at
+`shift=4` (16 ns per instruction), where the reads always differ.
 
 
 ## 10. Test plan for Q2

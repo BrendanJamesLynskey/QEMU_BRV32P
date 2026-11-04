@@ -1,7 +1,7 @@
-From 45176eb0f427e523cffc853307bd9803d2b01d0f Mon Sep 17 00:00:00 2001
+From 6409a747f95708d96adf70f8f025ac6256bc0517 Mon Sep 17 00:00:00 2001
 From: Brendan Lynskey <brendanlynskey@googlemail.com>
 Date: Tue, 3 Nov 2026 01:17:59 +0000
-Subject: [PATCH 4/6] hw/timer: add the BRV32P timer
+Subject: [PATCH 4/7] hw/timer: add the BRV32P timer
 
 A model of the timer of the BRV32P SoC: a prescaler, a compare register and
 an auto-reload counter, with a sticky match flag that is the timer

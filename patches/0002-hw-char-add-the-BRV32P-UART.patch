@@ -1,7 +1,7 @@
-From 201f385a8bfc5533a217e97c19d1b535be07057a Mon Sep 17 00:00:00 2001
+From 940403d0fc6029f3f3081edfbe5412dd8d6c6e8f Mon Sep 17 00:00:00 2001
 From: Brendan Lynskey <brendanlynskey@googlemail.com>
 Date: Tue, 3 Nov 2026 01:17:59 +0000
-Subject: [PATCH 2/6] hw/char: add the BRV32P UART
+Subject: [PATCH 2/7] hw/char: add the BRV32P UART
 
 A model of the UART of the BRV32P SoC (8N1, 16-bit clock divider,
 interrupt on receive-data-valid), register-exact to the RTL, including the

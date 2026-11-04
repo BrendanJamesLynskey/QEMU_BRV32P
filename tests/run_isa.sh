@@ -50,23 +50,22 @@ declare -A LD=( [rv32mi]="$RISCV_TESTS/env/p/link.ld" )
 SUITES=(rv32ui rv32um rv32uc rv32ui-c rv32um-c directed rv32mi)
 [ $# -gt 0 ] && SUITES=("$@")
 
-# Not run, with the reason; the first group is the core repo's own list
+# Not run, with the reason; the first group is the core repo's own list. (The tests that use the
+# custom Xbrvdsp, GF(2^8) and mod-q instructions run since step Q2; tests/run_lockstep.sh also
+# compares them with Spike.)
 declare -A SKIP=(
   [rv32ui/ma_data]="needs misaligned access in hardware; the core and the model trap (see directed/misaligned)"
   [rv32ui-c/ma_data]="as rv32ui/ma_data"
   [rv32ui-c/fence_i]="patches code assuming 32-bit encodings; assembled with C it overwrites compressed code"
-  # Custom Xbrvdsp/GF/mod-q instructions, step Q2
-  [directed/dsp_agu]="uses the custom DSP extension (step Q2)"
-  [directed/dsp_irq]="uses the custom DSP extension (step Q2)"
-  [directed/dsp_loop]="uses the custom DSP extension (step Q2)"
-  [directed/dsp_mac]="uses the custom DSP extension (step Q2)"
-  [directed/gf]="uses the custom GF(2^8) instructions (step Q2)"
-  [directed/mq]="uses the custom mod-q instructions (step Q2)"
-  [directed/mul_use]="uses the custom DSP extension (step Q2)"
   # rv32mi tests of features the core does not have (the model fails them too)
   [rv32mi/pmpaddr]="needs PMP; the core has none (fails at test case 1 on the model)"
   [rv32mi/instret_overflow]="needs a writable minstret and minstreth; the core cannot write minstret, and the model's counts instructions (fails at test case 2)"
 )
+
+# Virtual time per instruction is 2^shift ns (default 8 ns). The timer ticks every 10 ns, so with the
+# default two back-to-back reads of its count can fall in the same tick (the RTL's loads take several
+# cycles): periph_uncached, which needs them to differ, runs at 16 ns per instruction.
+declare -A SHIFT=( [directed/periph_uncached]=4 )
 
 : > "$B/results.txt"
 total=0; fails=0; skipped=0
@@ -87,7 +86,7 @@ for suite in "${SUITES[@]}"; do
       scount=$((scount + 1)); fails=$((fails + 1)); continue
     fi
     timeout 60 "$QEMU" -M brv32p -display none -monitor none -serial none -no-reboot \
-      -icount shift=3 -kernel "$out.elf" > "$out.log" 2>&1
+      -icount shift=${SHIFT[$t]:-3} -kernel "$out.elf" > "$out.log" 2>&1
     rc=$?
     scount=$((scount + 1))
     case $rc in

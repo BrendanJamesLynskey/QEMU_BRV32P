@@ -1,6 +1,9 @@
 # CI: build QEMU at the pinned release with the patch series, then run the
 # BRV32P tests on it: the core repo's ISA tests, the SoC firmware, and the
-# machine tests.
+# machine tests. Three jobs: `test` (the Q1 job, which now also builds the
+# execlog plugin), `spike` (Spike at the core repo's pinned revision, cached)
+# and `lockstep` (the custom-instruction tests on QEMU and on Spike, compared
+# instruction by instruction: tests/run_lockstep.sh).
 name: CI
 
 on:
@@ -10,6 +13,7 @@ on:
 env:
   CORE_REPO_URL: BrendanJamesLynskey/RISCV_RV32IMC_5stage
   RISCV_TESTS_REV: 3df703cd52d5f0d8224e3c50bf03c6cb70efff98    # riscv-tests, as the core repo's CI
+  SPIKE_REV: fb225a5f5e50d889305b8ef6e53c2b66d9e765f7          # riscv-isa-sim, as the core repo's CI
 
 jobs:
   test:
@@ -32,20 +36,34 @@ jobs:
 
       - name: Restore the QEMU build
         id: qemu-cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
-          path: build/qemu/qemu-system-riscv32
+          path: |
+            build/qemu/qemu-system-riscv32
+            build/qemu/contrib/plugins/libexeclog.so
           key: qemu-${{ hashFiles('QEMU_VERSION', 'patches/*.patch', 'scripts/build.sh') }}
 
       - name: Build QEMU (pinned release plus patches)
         if: steps.qemu-cache.outputs.cache-hit != 'true'
         run: JOBS="$(nproc)" scripts/build.sh
 
+      # Saved here, not at the end of the job, so that the lockstep job has the
+      # build even if a test below fails
+      - name: Save the QEMU build
+        if: steps.qemu-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            build/qemu/qemu-system-riscv32
+            build/qemu/contrib/plugins/libexeclog.so
+          key: qemu-${{ hashFiles('QEMU_VERSION', 'patches/*.patch', 'scripts/build.sh') }}
+
       - name: QEMU version and machine
         run: |
           build/qemu/qemu-system-riscv32 --version
           build/qemu/qemu-system-riscv32 -M help | grep brv32p
           build/qemu/qemu-system-riscv32 -cpu help | grep brv32p
+          test -f build/qemu/contrib/plugins/libexeclog.so
 
       - name: ISA tests (riscv-tests and the core repo's directed tests) and rv32mi
         run: |
@@ -79,3 +97,111 @@ jobs:
             tests/build/report.md
             tests/build/isa/results.txt
             tests/build/machine/results.txt
+
+  # Spike at the core repo's pinned revision, with the headers the model of the
+  # custom extensions compiles against. Its own job, so that the (slow) build
+  # is cached whatever the other jobs do.
+  spike:
+    name: Build Spike (cached)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y device-tree-compiler
+
+      - name: Restore Spike
+        id: spike-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/spike
+          key: spike-${{ env.SPIKE_REV }}-ubuntu-24.04-with-headers
+
+      - name: Build Spike
+        if: steps.spike-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone https://github.com/riscv-software-src/riscv-isa-sim.git /tmp/spike-src
+          cd /tmp/spike-src
+          git checkout "$SPIKE_REV"
+          git submodule update --init --depth 1
+          mkdir build && cd build
+          ../configure --prefix="$HOME/spike" --with-boost=no
+          make -j"$(nproc)"
+          make install
+          # Keep the source and generated headers: the core repo's model of the
+          # custom extensions compiles against them (tools/spike_xbrvdsp/build.sh)
+          mkdir -p "$HOME/spike/src/build"
+          cp -rL ../riscv ../fesvr ../softfloat ../fdt "$HOME/spike/src/"   # -L: softfloat links into its submodule
+          cp config.h insn_list.h "$HOME/spike/src/build/"
+
+  # The custom-instruction tests on QEMU and on Spike (with the core repo's
+  # model of the extensions), compared instruction by instruction
+  lockstep:
+    name: Lockstep with Spike (custom-instruction tests)
+    needs: [test, spike]
+    if: ${{ !cancelled() && needs.spike.result == 'success' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the RISC-V toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-riscv64-unknown-elf device-tree-compiler libglib2.0-dev
+
+      - name: Core repo (the tests, the env and the Spike model)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.CORE_REPO_URL }}
+          path: core
+
+      - name: Restore the QEMU build (from the test job)
+        id: qemu-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            build/qemu/qemu-system-riscv32
+            build/qemu/contrib/plugins/libexeclog.so
+          key: qemu-${{ hashFiles('QEMU_VERSION', 'patches/*.patch', 'scripts/build.sh') }}
+          fail-on-cache-miss: true
+
+      - name: Restore Spike
+        uses: actions/cache@v4
+        with:
+          path: ~/spike
+          key: spike-${{ env.SPIKE_REV }}-ubuntu-24.04-with-headers
+          fail-on-cache-miss: true
+
+      - name: Build the Spike model of the custom extensions (libxbrvdsp.so, from the core repo)
+        run: core/tools/spike_xbrvdsp/build.sh "$HOME/spike/src" "$HOME/spike/src/build" "$PWD/build/xbrvdsp"
+
+      - name: Lockstep with Spike (QEMU's execlog against Spike's commit log)
+        run: |
+          export CORE_REPO="$PWD/core" RISCV_TESTS="$PWD/core/tests/isa/riscv-tests"
+          git clone -q https://github.com/riscv-software-src/riscv-tests.git "$RISCV_TESTS"
+          git -C "$RISCV_TESTS" checkout -q "$RISCV_TESTS_REV"
+          git -C "$RISCV_TESTS" submodule update -q --init env
+          SPIKE="$HOME/spike/bin/spike" XBRVDSP_LIB="$PWD/build/xbrvdsp/libxbrvdsp.so" tests/run_lockstep.sh
+
+      - name: Short report
+        if: always()
+        run: |
+          {
+            echo "## BRV32P QEMU model: lockstep with Spike"
+            echo '```'
+            grep -h -E "^suite|passed" tests/build/lockstep/results.txt || true
+            grep -h -E "FAIL|BUILD|MISMATCH" tests/build/lockstep/results.txt || true
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY" > tests/build/lockstep/report.md
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: brv32p-qemu-lockstep
+          path: |
+            tests/build/lockstep/report.md
+            tests/build/lockstep/results.txt
+            tests/build/lockstep/*.S
+            tests/build/lockstep/*.qemu
+            tests/build/lockstep/*.spike

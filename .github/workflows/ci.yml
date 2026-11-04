@@ -3,16 +3,26 @@
 # machine tests. Three jobs: `test` (the Q1 job, which now also builds the
 # execlog plugin), `spike` (Spike at the core repo's pinned revision, cached)
 # and `lockstep` (the custom-instruction tests on QEMU and on Spike, compared
-# instruction by instruction: tests/run_lockstep.sh).
+# instruction by instruction: tests/run_lockstep.sh) and `three-platforms` (one ELF
+# per program on QEMU, Spike and the RTL under Icarus, compared: tests/run_three.sh).
 name: CI
 
+# The heavy jobs run once per change: on pull requests, and on pushes to main
+# (not on every push to a branch that has a pull request), and a newer run of
+# the same ref cancels the older one
 on:
   push:
+    branches: [main]
   pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CORE_REPO_URL: BrendanJamesLynskey/RISCV_RV32IMC_5stage
   RISCV_TESTS_REV: 3df703cd52d5f0d8224e3c50bf03c6cb70efff98    # riscv-tests, as the core repo's CI
+  CORE_REV: bc75bf84c23a91e48bed001cebf0387f914c16c6    # the core repo's commit the three-platforms job is run against
   SPIKE_REV: fb225a5f5e50d889305b8ef6e53c2b66d9e765f7          # riscv-isa-sim, as the core repo's CI
 
 jobs:
@@ -205,3 +215,90 @@ jobs:
             tests/build/lockstep/*.S
             tests/build/lockstep/*.qemu
             tests/build/lockstep/*.spike
+
+  # One ELF per program, built once and run on QEMU, on Spike (with the core
+  # repo's model of the custom extensions) and on the RTL (the core repo's
+  # tb_isa.v under Icarus), the results compared: tests/run_three.sh. The core
+  # repo is checked out at CORE_REV so the RTL is the one the results are for.
+  three-platforms:
+    name: One ELF on QEMU, Spike and the RTL
+    needs: [test, spike]
+    if: ${{ !cancelled() && needs.spike.result == 'success' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the RISC-V toolchain and Icarus Verilog
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-riscv64-unknown-elf iverilog device-tree-compiler libglib2.0-dev
+
+      - name: Core repo (the RTL, the tests, the env and the Spike model), at the pinned commit
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.CORE_REPO_URL }}
+          ref: ${{ env.CORE_REV }}
+          path: core
+
+      - name: Restore the QEMU build (from the test job)
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            build/qemu/qemu-system-riscv32
+            build/qemu/contrib/plugins/libexeclog.so
+          key: qemu-${{ hashFiles('QEMU_VERSION', 'patches/*.patch', 'scripts/build.sh') }}
+          fail-on-cache-miss: true
+
+      - name: Restore Spike
+        uses: actions/cache@v4
+        with:
+          path: ~/spike
+          key: spike-${{ env.SPIKE_REV }}-ubuntu-24.04-with-headers
+          fail-on-cache-miss: true
+
+      - name: Build the Spike model of the custom extensions (libxbrvdsp.so, from the core repo)
+        run: core/tools/spike_xbrvdsp/build.sh "$HOME/spike/src" "$HOME/spike/src/build" "$PWD/build/xbrvdsp"
+
+      - name: Build every program once and run it on the three platforms
+        run: |
+          export CORE_REPO="$PWD/core" RISCV_TESTS="$PWD/core/tests/isa/riscv-tests"
+          git clone -q https://github.com/riscv-software-src/riscv-tests.git "$RISCV_TESTS"
+          git -C "$RISCV_TESTS" checkout -q "$RISCV_TESTS_REV"
+          git -C "$RISCV_TESTS" submodule update -q --init env
+          SPIKE="$HOME/spike/bin/spike" XBRVDSP_LIB="$PWD/build/xbrvdsp/libxbrvdsp.so" tests/run_three.sh
+
+      - name: A mismatch is caught (corrupted copies of the results)
+        run: CORE_REPO="$PWD/core" tests/three_compare.py tests/build/three --selftest
+
+      - name: Report
+        if: always()
+        run: |
+          {
+            echo "## BRV32P: one ELF, three platforms"
+            echo "QEMU $(cat QEMU_VERSION) plus $(ls patches/*.patch | wc -l) patches; core repo at ${CORE_REV:0:7}"
+            echo '```'
+            cat tests/build/three/results.txt || true
+            echo '```'
+            echo
+            cat tests/build/three/results_q3.md || true
+            echo
+            echo "SHA-256 of the ELFs"
+            echo '```'
+            cat tests/build/three/sha256.txt || true
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY" > /dev/null
+
+      - name: Upload the ELFs, the table and the logs
+        if: always()
+        run: |
+          cd tests/build/three
+          tar czf logs.tgz *.rtl.* *.qemu.* *.spike.* *.dis *.meta 2> /dev/null || true
+          mkdir -p ../three-upload
+          cp *.elf sha256.txt results.txt results_q3.md programs.txt logs.tgz ../three-upload/ || true
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: brv32p-three-platforms
+          path: tests/build/three-upload

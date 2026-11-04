@@ -63,11 +63,20 @@ for name in "${tests[@]}"; do
     printf '%-24s BUILD FAIL (see %s)\n' "$t" "$out.build.log" | tee -a "$B/results.txt"; fails=$((fails + 1)); continue
   fi
   tohost="$("${CROSS}nm" "$out.elf" | awk '$3 == "tohost" { print $1 }')"
-  timeout 300 "$QEMU" -M brv32p -display none -monitor none -serial none -no-reboot -kernel "$out.elf" \
-    -plugin "$PLUGIN_ARGS" -d plugin,int -D "$out.qemu" > "$out.qemu.out" 2>&1
+  # First without the trace: a test that never reaches tohost must not fill the disk with a log
+  timeout 30 "$QEMU" -M brv32p -display none -monitor none -serial none -no-reboot -kernel "$out.elf" \
+    > "$out.plain.out" 2>&1
+  prc=$?
+  if [ "$prc" -eq 124 ]; then
+    fails=$((fails + 1)); printf '%-24s FAIL timeout (QEMU does not reach tohost in 30 s)\n' "$t" | tee -a "$B/results.txt"; continue
+  fi
+  # The traced run, with the log capped (500 MB) and a time limit
+  ( ulimit -f 1000000; timeout 120 "$QEMU" -M brv32p -display none -monitor none -serial none -no-reboot -kernel "$out.elf" \
+      -plugin "$PLUGIN_ARGS" -d plugin,int -D "$out.qemu" > "$out.qemu.out" 2>&1 )
   qrc=$?
-  timeout 300 "$SPIKE" --isa="$MARCH" --extlib="$XBRVDSP_LIB" --extension=xbrvdsp \
-    -m0x80000000:0x8000 --log-commits "$out.elf" 2> "$out.spike" > /dev/null
+  ( ulimit -f 1000000; timeout 120 "$SPIKE" --isa="$MARCH" --extlib="$XBRVDSP_LIB" --extension=xbrvdsp \
+      -m0x80000000:0x8000 --log-commits "$out.elf" 2> "$out.spike" > /dev/null )
+  echo "  $t: QEMU exit $prc plain / $qrc traced; logs $(stat -c %s "$out.qemu") and $(stat -c %s "$out.spike") bytes"
   res="$(python3 "$HERE/lockstep_qemu.py" "$out.qemu" "$out.spike" --tohost "$tohost" 2>&1 | tail -n 12)"
   last="$(printf '%s\n' "$res" | tail -n 1)"
   case "$last" in
@@ -78,7 +87,8 @@ for name in "${tests[@]}"; do
             fi ;;
     *)      fails=$((fails + 1))
             printf '%-24s FAIL lockstep (QEMU exit %d)\n' "$t" "$qrc" | tee -a "$B/results.txt"
-            printf '%s\n' "$res" | sed 's/^/    /' | tee -a "$B/results.txt" ;;
+            printf '%s\n' "$res" | sed 's/^/    /' | tee -a "$B/results.txt"
+            tail -n 3 "$out.qemu.out" | sed 's/^/    qemu: /' | tee -a "$B/results.txt" ;;
   esac
 done
 printf 'suite %-10s %d / %d passed, 0 not run\n' lockstep "$((total - fails))" "$total" | tee -a "$B/results.txt"

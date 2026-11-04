@@ -14,7 +14,7 @@ The repo is a **patch series against a pinned QEMU release**, not a QEMU tree. T
 |---|---|---|
 | Q0 | [design note](docs/design.md), taken from the RTL | PR `q0-design` |
 | Q1 | the machine, the three peripherals, ELF loading with `tohost` exit; tests and CI | PR `q1-machine` |
-| Q2 | the custom extensions (Xbrvdsp, GF, mod-q) by decodetree, checked against the Spike library | outlined in the design note |
+| Q2 | the custom extensions (Xbrvdsp, GF, mod-q) by decodetree, checked against the Spike library | PR `q2-extensions` |
 | Q3 | one ELF on QEMU, Spike and RTL in CI | outlined in the design note |
 
 ## Build and run
@@ -37,10 +37,13 @@ The GPIO pins are the QOM properties `gpio-in` (writable) and `gpio-out` of `/ma
 | Path | Contents |
 |---|---|
 | [`docs/design.md`](docs/design.md) | the design note: memory map, registers, interrupts, boot, how tests end, scope |
-| [`patches/`](patches) | the series: `target/riscv` CPU, `hw/char`, `hw/gpio`, `hw/timer`, `hw/riscv` machine; GPL-2.0-or-later |
+| [`patches/`](patches) | the series: `target/riscv` CPU, `hw/char`, `hw/gpio`, `hw/timer`, `hw/riscv` machine, the custom extensions (0007); GPL-2.0-or-later |
 | [`scripts/build.sh`](scripts/build.sh) | fetch the pinned tag shallowly, apply the patches, configure a minimal `riscv32-softmmu`, make |
 | [`tests/run_isa.sh`](tests/run_isa.sh) | the core repo's ISA tests (riscv-tests, directed) and rv32mi, run through `tohost` |
 | [`tests/run_machine.py`](tests/run_machine.py) | SoC firmware, timer, UART and GPIO tests |
+| [`tests/run_lockstep.sh`](tests/run_lockstep.sh) | the custom-instruction tests on QEMU and on Spike (with the core repo's `libxbrvdsp.so`), compared instruction by instruction |
+| [`tests/lockstep_qemu.py`](tests/lockstep_qemu.py) | the comparison: QEMU's `execlog` plugin against Spike's commit log |
+| [`tests/gen_random.py`](tests/gen_random.py) | writes the randomised operand tests (`rand_alu`, `rand_gf`, `rand_mq`, `rand_agu`, `rand_loop`) |
 | [`tests/machine/`](tests/machine) | the machine tests written for the model: [`timer.S`](tests/machine/timer.S), [`uart.S`](tests/machine/uart.S), [`gpio.S`](tests/machine/gpio.S) |
 | [`.github/workflows/ci.yml`](.github/workflows/ci.yml) | build QEMU (cached), install the RISC-V GCC as the core repo's CI does, run the tests, upload a report |
 | [`docs/pr/`](docs/pr) | the pull request bodies |

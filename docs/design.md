@@ -241,40 +241,26 @@ Left out, and where the model therefore differs from the RTL:
 | Left out | Effect |
 |---|---|
 | **Cycle timing.** One instruction takes one unit of virtual time, not the CPI of the pipeline. | The time of interrupts relative to the program, and `mcycle`, are not those of the RTL. |
-| **Caches.** | See below: this matters for peripheral reads. |
+| **Caches.** | The RTL's D-cache now bypasses the peripheral window (see below), so peripheral reads agree; the model's cacheless reads are live. |
 | **AXI** and the bridge handshakes. | No bus latency, no write-buffer ordering. |
 | Aliases of the SRAM other than 0x0 and 0x8000_0000; the repeat of the peripheral window through `0x2xxx_xxxx`; SRAM beyond 32 KB (the RTL wraps, the model has an access fault). | A program that relies on wrap-around differs. |
 | The 2- and 3-clock input delay of the GPIO. | A pin change is seen at once. |
 | **Unknown CSRs, `WFI`.** | The RTL reads 0 and ignores writes for any CSR it does not have (no trap), and `WFI` traps. In the model a CSR that does not exist raises an illegal-instruction exception (`time`, the `0x7c0` custom range), the generic CSRs `cycle`, `instret`, `misa` and `mvendorid` read their own values (the RTL reads 0), and `WFI` runs. A binary that passes on the RTL does not use them. |
 | `mstatus.MPP`, `misa`, `mtvec` vectored mode, the other machine CSRs of section 3. | QEMU's CSR unit is the generic RISC-V one: `mstatus` reads with `MPP = 3`, `misa` exists. |
 
-### A finding in the RTL: peripheral registers go through the D-cache
+### A finding in the RTL: peripheral registers went through the D-cache (fixed in core PR #30)
 
-`rtl/cache/dcache.v` has **no bypass for peripheral addresses**: every load and store, including those to
-`0x2xxx_xxxx`, is looked up by tag and a read miss fills a 16-byte line with four word reads
-(`dcache.v:52-66,158-162`). Two consequences, both seen in simulation:
-
-* After the first access, a peripheral register read is served from the cache. A program that enables the
-  timer and reads `COUNT` twice, 200 loop iterations apart, gets the same value both times (Icarus,
-  `tb_isa.v`, FAIL). Polling `UART STATUS` or `GPIO DATA_IN` would spin on a stale word.
-* A line fill reads the neighbouring registers, with their side effects: filling the UART line (0x100 to 0x10C)
-  reads `RXDATA` (0x104), which clears `rx_valid`.
-
-The model has no cache, so its peripheral reads are always live. The RTL as it stands cannot poll a peripheral.
-This is not changed here (the core repo is read-only for this work); it is reported to the owner. A fix would
-be to bypass the cache for `addr[31:28] == 2`.
+**Fixed in core PR #30 (`bc75bf8`):** the D-cache bypasses `addr[31:28] == 2`, and a finished uncached access
+is not repeated under a fetch stall. The model never had the problem (it has no cache); it is kept here as
+history. What Q0 found at `c9c2c9f`: `rtl/cache/dcache.v` had no bypass for peripheral addresses, so every
+load and store to `0x2xxx_xxxx` was looked up by tag and a read miss filled a 16-byte line with four word
+reads. A program that read the timer's `COUNT` twice, 200 loop iterations apart, got the same value both
+times, and filling the UART's line read `RXDATA` (0x104), which cleared `rx_valid`. With the fix, peripheral
+registers can be polled on the RTL as they are on the model.
 
 ## 7. Outline of Q2 and Q3
 
-**Q2: the custom extensions.** Xbrvdsp, the GF(2^8) multiply and the mod-q unit are added to the `brv32p` CPU as
-a QEMU vendor extension: a `xbrvdsp.decode` decodetree file (as `xthead.decode` and `xlrbr.decode` are done in
-`target/riscv`), with helper functions where an instruction is not a few TCG ops (saturating add, the packed
-halves, the address generators and the hardware-loop registers, the mod-q reduction). The encodings and
-semantics are those of the RTL decoder and of the Spike model in the core repo
-(`tools/spike_xbrvdsp`): that library is the reference, and each QEMU instruction is checked against it,
-instruction by instruction, with the same directed tests (`tests/directed/dsp_*`, `gf`, `mq`, `mul_use`) and
-randomised operands. The state the extension adds (AGU registers, loop registers) is added to `CPURISCVState`
-and to the migration description.
+**Q2: the custom extensions.** Done: section 9 (the design) and section 10 (the tests).
 
 **Q3: one ELF, three simulators.** A CI job builds a test ELF once, runs it on QEMU, on Spike (with the
 extension library) and on the RTL (Icarus), and compares: the final `tohost` value, the UART output, and for
@@ -289,3 +275,120 @@ output; the cycle counts of course differ, and are reported only for the RTL.
 | ISA | riscv-tests rv32ui, rv32um, rv32uc, rv32ui-c, rv32um-c as built for the core, and the directed tests without custom instructions (`csr_use`, `fence_i_fill`, `fence_i_warm`, `misaligned`, `timer_irq`, `zk`) | `tests/run_isa.sh` |
 | rv32mi | the machine-mode tests, built with the upstream env; on the model and Spike only, as the core repo does not run them | `tests/run_isa.sh rv32mi` |
 | Machine | SoC firmware (UART byte, GPIO pattern, registers, `mcause = 11`), `timer.S`, `uart.S`, `gpio.S` | `tests/run_machine.py` |
+
+## 9. Q2: the custom extensions
+
+Xbrvdsp (the multiply-accumulate unit, the address registers and the hardware loop), the packed GF(2^8)
+multiply and the mod-q unit are a vendor extension of the `brv32p` CPU, patch 0007. It is on for `brv32p` only
+(the cfg flag `ext_xbrvdsp`, set in the CPU's definition), and is in the ISA string as `xbrvdsp`. The reference
+is the core repo's Spike model, `tools/spike_xbrvdsp/xbrvdsp.cc`, loaded as `libxbrvdsp.so`: every QEMU
+instruction is checked against it, instruction by instruction (section 10). The RTL (`decoder.v`,
+`dsp_unit.v`, `agu.v`, `loop_unit.v`, `gf_unit.v`, `mq_unit.v`) was read alongside it.
+
+### Decode
+
+`target/riscv/xbrvdsp.decode` is a decodetree file in the vendor-extension pattern: its decoder is added to
+`decoder_table` in `translate.c`, gated on `ext_xbrvdsp`. The 45 patterns fix every field the RTL decoder
+requires to be zero (`rd` for the accumulator updates, `rs1` and `rs2` for the reads, the upper bits of `rd`
+for the address-register writes, the upper bits of the immediate for the loads and reads), so the same words
+are illegal in the model and in the RTL, and in Spike (whose masks are the same). A word the patterns do not
+match raises an illegal-instruction exception.
+
+| Group | Opcode, funct3 | Instructions |
+|---|---|---|
+| accumulator | custom-0 (0x0B), 000, 001, 010, 011 | `mac` `dmac` `msu` and their `.lp` forms (funct7 bit 6), `acc.set` `acc.seth` `acc.rd` `acc.rdh` `acc.rdl` `acc.rdx` |
+| saturating, packed | custom-0, 100 | `sadd` `ssub` `radd16` `rsub16` `pk16` |
+| GF(2^8) | custom-0, 101 | `gfmul4` `gf.cfg` `gf.rd` |
+| mod q | custom-0, 110 | `mqmul2` `mqadd2` `mqsub2` `ctadd2` `ctsub2` `gsmul2` `mq.cfg` `mq.zeta` `mq.rd` `mq.rdz` |
+| address registers | custom-1 (0x2B), 000, 001, 010, 011, 101 | `ar.set` `ar.cfg` `ar.mode` `ar.rd` `ar.rds` `ar.rdm` `lh.a` `lw.a` `lhu.a` |
+| hardware loop | custom-1, 000, 011, 110, 111 | `lp.setup` `lp.set` `lp.sets` `lp.rd` `lp.rds` `lp.end` |
+
+### State
+
+In `CPURISCVState` (`cpu.h`), reset in `riscv_cpu_reset_hold` to the RTL's reset values, and migrated in the
+`cpu/xbrvdsp` subsection (`machine.c`), present only when the extension is on:
+
+| State | Size | Reset | RTL |
+|---|---|---|---|
+| accumulator | 40 bits, held sign-extended in 64 | 0 | `dsp_unit.v` |
+| `ar0` to `ar3`: address, stride, bit-reversed mode | 32, 16, 1 bits each | 0, 0, 0 | `agu.v` |
+| loop count `lc`, loop start `lp_start` | 32 bits each | 0, 0 | `loop_unit.v` |
+| GF polynomial | 8 bits | 0x1D | `gf_unit.v` |
+| `q`, `q'`, `zeta` | 16 bits each | 3329, 3327, 0 | `mq_unit.v` |
+
+The RTL's `zqp` register (zeta times q' mod 2^16) is a timing device of its two-stage multiplier; its effect
+is the same product, so the model does not keep it.
+
+### The arithmetic
+
+Helpers (`target/riscv/tcg/xbrvdsp_helper.c`) do everything that is not a move of a register: the accumulate
+and the rounded, saturating reads, the saturating and packed-half operations, the byte-lane GF multiply by
+Horner's rule, the Montgomery multiply and reduction mod q, the stepping of an address register (including
+the reverse-carry add of the bit-reversed mode) and the loop count. The translator (`trans_xbrvdsp.c.inc`)
+picks the helper and moves the registers. The helper code is a transcription of the Spike model; where the
+RTL computes the same function by a different route (the GF fold of x^(8+j), the 17-bit mod-q reductions) the
+two agree for every operand, which the randomised tests exercise.
+
+### Address registers: the load comes first
+
+`lh.a`, `lw.a` and `lhu.a` read the address register, do the load with the alignment check on, and only then
+call the helper that steps the register. A misaligned load raises the load-address-misaligned exception
+(`mtval` is the address) and leaves the register as it was, as `agu.v` and Spike do.
+
+### The hardware loop
+
+The loop-back is a branch whose target is only known at run time, so `mac.lp`, `dmac.lp`, `msu.lp` and `lp.end`
+end the translation block: the multiply-accumulate (if any) runs, then a helper takes the next pc: while
+`lc > 1` it counts down and returns `lp_start`, otherwise `lc` becomes 0 and it returns the address of the next
+instruction. `lp.setup` sets `lc = rs1` and `lp_start = pc + 4`; a count of 0 or 1 runs the body once.
+
+Interrupts and traps are taken between instructions, and a loop-ending instruction either completes (counts
+down, goes round) or has not started; QEMU never leaves it half done, as the RTL's EX-stage squash never lets
+a squashed one update `acc` or `lc`. So, as `dsp_irq.S` tests:
+
+* An interrupt taken when the next instruction is a loop-ending one has `mepc` = the address of that
+  instruction. After `mret` it runs once, and counts down once. The interrupt neither adds nor counts.
+* An interrupt taken after a loop-back has `mepc` = `lp_start` (the instruction the loop went back to).
+* A loop-ending instruction cannot itself raise an exception (it only touches the accumulator and the loop
+  registers), so there is no `mepc` of a trap from one other than the above. A trap inside a body (a
+  misaligned `lw.a`, say) has `mepc` = that load; the loop registers are not saved by the trap, so a handler
+  that uses a hardware loop must save and restore them (`lp.rd`, `lp.rds`, `lp.set`, `lp.sets`).
+* `lc` and `lp_start` are one set, not a stack: the loops do not nest.
+
+Not covered, because neither Spike nor the tests do: a `lp_start` with bit 0 set (an odd address) and a
+loop body that runs into the interrupt of a peripheral that is not modelled.
+
+### Differences found
+
+Reading the RTL against the Spike model (decode masks, reset values, rounding and saturation, the
+bit-reversed step, the loop count, the mod-q reductions, `lp.rd` and `lp.rds`) found none: the two agree, and the
+core repo's own lockstep (RTL against Spike) agrees with that. The differences between the model and the RTL
+are timing only (a QEMU instruction is one unit of time; the RTL's `mqmul2` takes two cycles in MEM) and are not observable to a program, other than through `mcycle`.
+
+
+## 10. Test plan for Q2
+
+| Suite | What | Where |
+|---|---|---|
+| ISA | the 7 directed tests that use the custom instructions (`dsp_agu`, `dsp_irq`, `dsp_loop`, `dsp_mac`, `gf`, `mq`, `mul_use`), now run with the rest of the directed tests | `tests/run_isa.sh` |
+| Lockstep | the six of them Spike can run (all but `dsp_irq`, which needs the timer and checks itself) and five randomised operand tests, QEMU against Spike | `tests/run_lockstep.sh` |
+
+The lockstep builds each test as the core repo's runner does and runs it on QEMU with the `execlog` TCG plugin
+(`-d plugin,int`, the 31 general registers watched) and on Spike (`--extlib=libxbrvdsp.so --extension=xbrvdsp
+--log-commits`). `tests/lockstep_qemu.py` compares, per retired instruction, the pc, the encoding and the
+register written, so every result of every custom instruction (they all end up in a register), including the
+state reads `acc.rd*`, `ar.rd*`, `lp.rd*`, `gf.rd` and `mq.rd*`. The plugin logs a register only when its value
+changes and logs an instruction that traps; the script keeps a register shadow, and drops the record of a
+trapping instruction (named by the `-d int` line). A mismatch fails the test. The run must end at QEMU's store
+to `tohost`, which must be Spike's matching store.
+
+`tests/gen_random.py` writes the randomised tests (fixed seed): 256 operand sets per instruction, drawn at
+random with a bias to the edges (0, -1, the 16- and 32-bit limits), the results stored to memory.
+
+| File | Covers |
+|---|---|
+| `rand_alu` | `mac` `dmac` `msu` `acc.set` `acc.seth` `acc.rdl` `acc.rdx` over random 40-bit accumulators; `acc.rd` and `acc.rdh` at 12 shifts each; `sadd` `ssub` `radd16` `rsub16` `pk16`, also with `rd` = `rs1` or `rs2` |
+| `rand_gf` | `gfmul4` for 12 polynomials (0x1D, 0x1B, 0x00, 0xFF, 0x01, 0x87 and six random), `gf.cfg`, `gf.rd` |
+| `rand_mq` | the six mod-q operations over 8 configurations of `q` and `q'` (the ML-KEM, 12289 and 7681 pairs, a `q'` that is not -q^-1, `q` = 0, 1 and 65535) with a new random `zeta` for every operand set; `mq.cfg`, `mq.zeta`, `mq.rd`, `mq.rdz` |
+| `rand_agu` | `ar.set` `ar.cfg` `ar.mode` `ar.rd` `ar.rds` `ar.rdm` `lh.a` `lw.a` `lhu.a` over random address register, start, stride and load kind, plain (56 chains) and bit-reversed (32 chains) |
+| `rand_loop` | 120 loops of random count (0 to 60) and shape (`mac.lp`, `dmac.lp`, `msu.lp` and `lp.end` as last instruction; a load, a branch or a GF multiply in the body; set up by `lp.setup` or `lp.set` and `lp.sets`), reading `lc` and `lp_start` with `lp.rd` and `lp.rds` |

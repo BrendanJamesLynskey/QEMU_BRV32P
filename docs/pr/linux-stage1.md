@@ -38,6 +38,6 @@ See [`docs/linux.md`](docs/linux.md) for the tables.
 
 - No-MMU userspace (flat or FDPIC binaries) was not built, so the no-MMU kernel stops at the init exec.
 - The kernel is not minimal: most of `rv32_defconfig`'s drivers remain.
-- The pass or fail of the `linux-boot` CI job is stated in the PR conversation after its run.
+- CI: all five jobs pass on the PR (`linux-boot` 29 min cold, building the toolchain, kernel and OpenSBI; later runs use the cache).
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)

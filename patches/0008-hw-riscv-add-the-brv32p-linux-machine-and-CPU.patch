@@ -1,0 +1,385 @@
+From ee72402534f6eea38d54eb4011eb3baa3ed48ddc Mon Sep 17 00:00:00 2001
+From: Brendan Lynskey <brendanlynskey@googlemail.com>
+Date: Sat, 28 Nov 2026 10:13:54 +0000
+Subject: [PATCH 8/8] hw/riscv: add the brv32p-linux machine and CPU
+
+The brv32p-linux machine is the BRV32P SoC with the smallest set of additions
+that Linux needs, to settle what a Linux-capable RTL must gain. The CPU is the
+brv32p with the A extension, S and U modes, Sv32 and the cycle, time and
+instret counters with their high halves; it keeps the custom extensions and
+the misaligned-access trap, and has no PMP. The machine adds an ACLINT in the
+layout of the SiFive CLINT at 0x20010000 and 128 MiB of RAM at 0x80000000,
+decoded fully, and keeps the boot SRAM at 0 and the GPIO, UART and timer where
+the RTL has them. The firmware, kernel, initramfs and device tree are loaded
+as for the virt machine. -M brv32p is unchanged.
+
+Signed-off-by: Brendan Lynskey <brendanlynskey@googlemail.com>
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ hw/riscv/Kconfig                |  10 ++
+ hw/riscv/brv32p_linux.c         | 212 ++++++++++++++++++++++++++++++++
+ hw/riscv/meson.build            |   1 +
+ include/hw/riscv/brv32p_linux.h |  48 ++++++++
+ target/riscv/cpu-qom.h          |   1 +
+ target/riscv/cpu.c              |  25 ++++
+ 6 files changed, 297 insertions(+)
+ create mode 100644 hw/riscv/brv32p_linux.c
+ create mode 100644 include/hw/riscv/brv32p_linux.h
+
+diff --git a/hw/riscv/Kconfig b/hw/riscv/Kconfig
+index 1244208..c901bfa 100644
+--- a/hw/riscv/Kconfig
++++ b/hw/riscv/Kconfig
+@@ -119,6 +119,16 @@ config BRV32P
+     select BRV32P_UART
+     select OR_IRQ
+ 
++config BRV32P_LINUX
++    bool
++    default y
++    depends on RISCV32
++    select BRV32P_GPIO
++    select BRV32P_TIMER
++    select BRV32P_UART
++    select RISCV_ACLINT
++    select SIFIVE_TEST
++
+ config SPIKE
+     bool
+     default y
+diff --git a/hw/riscv/brv32p_linux.c b/hw/riscv/brv32p_linux.c
+new file mode 100644
+index 0000000..8c32cfa
+--- /dev/null
++++ b/hw/riscv/brv32p_linux.c
+@@ -0,0 +1,212 @@
++/*
++ * BRV32P Linux machine
++ *
++ * Copyright (c) 2026 Brendan Lynskey
++ *
++ * The BRV32P SoC (see brv32p.c) with the smallest set of additions that
++ * Linux needs, for deciding what a Linux-capable RTL must gain:
++ *
++ *  - an RV32IMAC hart with M, S and U modes, Sv32 and 64-bit counters
++ *    (the brv32p-linux CPU, with the BRV32P custom extensions);
++ *  - an ACLINT (mtime, mtimecmp, msip) in the layout of the SiFive CLINT,
++ *    at 0x20010000, for the timer and software interrupts;
++ *  - 128 MiB of RAM at 0x80000000, decoded fully (no aliasing).
++ *
++ * The 32 KB boot SRAM at 0 (the RTL's reset address) holds the reset vector,
++ * and the GPIO, UART and timer are where the RTL has them. There is no PLIC:
++ * the console is the SBI console of OpenSBI, which drives the BRV32P UART by
++ * polling. The firmware (-bios, OpenSBI fw_dynamic), the kernel (-kernel), the
++ * initramfs (-initrd) and the device tree (-dtb) are loaded as for the virt
++ * machine.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/units.h"
++#include "qemu/error-report.h"
++#include "qapi/error.h"
++#include "hw/core/boards.h"
++#include "hw/core/loader.h"
++#include "hw/core/qdev-properties.h"
++#include "hw/core/qdev-properties-system.h"
++#include "hw/core/sysbus.h"
++#include "hw/intc/riscv_aclint.h"
++#include "hw/misc/sifive_test.h"
++#include "hw/riscv/boot.h"
++#include "hw/riscv/brv32p_linux.h"
++#include "hw/riscv/machines-qom.h"
++#include "system/device_tree.h"
++#include "system/system.h"
++#include "target/riscv/cpu.h"
++
++static const MemMapEntry brv32p_linux_memmap[] = {
++    [BRV32P_LINUX_DEV_SRAM] =  { 0x00000000, 0x8000 },
++    [BRV32P_LINUX_DEV_GPIO] =  { 0x20000000, 0x100 },
++    [BRV32P_LINUX_DEV_UART] =  { 0x20000100, 0x100 },
++    [BRV32P_LINUX_DEV_TIMER] = { 0x20000200, 0x100 },
++    [BRV32P_LINUX_DEV_CLINT] = { 0x20010000, 0x10000 },
++    [BRV32P_LINUX_DEV_TEST] =  { 0x20020000, 0x1000 },
++    [BRV32P_LINUX_DEV_DRAM] =  { 0x80000000, 128 * MiB },
++};
++
++static void brv32p_linux_machine_init(MachineState *machine)
++{
++    BRV32PLinuxState *s = BRV32P_LINUX_MACHINE(machine);
++    const MemMapEntry *memmap = brv32p_linux_memmap;
++    MemoryRegion *sys_mem = get_system_memory();
++    RISCVBootInfo boot_info;
++    DeviceState *cpu_dev;
++    hwaddr firmware_end_addr, firmware_start;
++    vaddr kernel_start_addr;
++    uint64_t kernel_entry = 0, fdt_load_addr;
++    int i, fdt_size;
++
++    if (machine->ram_size < 4 * MiB ||
++        machine->ram_size > 4 * GiB - memmap[BRV32P_LINUX_DEV_DRAM].base) {
++        error_report("brv32p-linux: RAM size must be 4 MiB to 2 GiB");
++        exit(EXIT_FAILURE);
++    }
++
++    /* The boot SRAM at the RTL's reset address, and the RAM, fully decoded */
++    memory_region_init_ram(&s->sram, NULL, "riscv.brv32p.sram",
++                           memmap[BRV32P_LINUX_DEV_SRAM].size, &error_fatal);
++    memory_region_add_subregion(sys_mem, memmap[BRV32P_LINUX_DEV_SRAM].base,
++                                &s->sram);
++    memory_region_add_subregion(sys_mem, memmap[BRV32P_LINUX_DEV_DRAM].base,
++                                machine->ram);
++
++    object_initialize_child(OBJECT(machine), "soc", &s->soc,
++                            TYPE_RISCV_HART_ARRAY);
++    object_property_set_str(OBJECT(&s->soc), "cpu-type", machine->cpu_type,
++                            &error_abort);
++    object_property_set_int(OBJECT(&s->soc), "num-harts", 1, &error_abort);
++    object_property_set_int(OBJECT(&s->soc), "resetvec",
++                            memmap[BRV32P_LINUX_DEV_SRAM].base, &error_abort);
++    sysbus_realize(SYS_BUS_DEVICE(&s->soc), &error_fatal);
++    cpu_dev = DEVICE(&s->soc.harts[0]);
++
++    /* The BRV32P external interrupt is gpio_irq | uart_irq; there is no PLIC */
++    object_initialize_child(OBJECT(machine), "ext-irq", &s->ext_irq,
++                            TYPE_OR_IRQ);
++    qdev_prop_set_uint16(DEVICE(&s->ext_irq), "num-lines", 2);
++    qdev_realize(DEVICE(&s->ext_irq), NULL, &error_fatal);
++    qdev_connect_gpio_out(DEVICE(&s->ext_irq), 0,
++                          qdev_get_gpio_in(cpu_dev, IRQ_M_EXT));
++
++    /* The ACLINT in the layout of the SiFive CLINT: msip, mtimecmp, mtime */
++    riscv_aclint_swi_create(memmap[BRV32P_LINUX_DEV_CLINT].base, 0, 1, false);
++    riscv_aclint_mtimer_create(memmap[BRV32P_LINUX_DEV_CLINT].base +
++                               RISCV_ACLINT_SWI_SIZE,
++                               RISCV_ACLINT_DEFAULT_MTIMER_SIZE, 0, 1,
++                               RISCV_ACLINT_DEFAULT_MTIMECMP,
++                               RISCV_ACLINT_DEFAULT_MTIME,
++                               RISCV_ACLINT_DEFAULT_TIMEBASE_FREQ, true);
++
++    /*
++     * The power-off register of the SBI reset (a finisher, as in the virt
++     * machine): not part of the RTL, there to end a headless run cleanly
++     */
++    sifive_test_create(memmap[BRV32P_LINUX_DEV_TEST].base);
++
++    /* The BRV32P peripherals, where the RTL has them (as in brv32p.c) */
++    object_initialize_child(OBJECT(machine), "gpio", &s->gpio,
++                            TYPE_BRV32P_GPIO);
++    sysbus_realize(SYS_BUS_DEVICE(&s->gpio), &error_fatal);
++    sysbus_mmio_map(SYS_BUS_DEVICE(&s->gpio), 0,
++                    memmap[BRV32P_LINUX_DEV_GPIO].base);
++    sysbus_connect_irq(SYS_BUS_DEVICE(&s->gpio), 0,
++                       qdev_get_gpio_in(DEVICE(&s->ext_irq), 0));
++    for (i = 0; i < ARRAY_SIZE(s->gpio_alias); i++) {
++        memory_region_init_alias(&s->gpio_alias[i], OBJECT(machine),
++                                 "riscv.brv32p.gpio.alias",
++                                 sysbus_mmio_get_region(SYS_BUS_DEVICE(&s->gpio),
++                                                        0),
++                                 0, memmap[BRV32P_LINUX_DEV_GPIO].size);
++        memory_region_add_subregion(sys_mem,
++            memmap[BRV32P_LINUX_DEV_GPIO].base + (i + 3) * 0x100,
++            &s->gpio_alias[i]);
++    }
++
++    object_initialize_child(OBJECT(machine), "uart", &s->uart,
++                            TYPE_BRV32P_UART);
++    if (serial_hd(0)) {
++        qdev_prop_set_chr(DEVICE(&s->uart), "chardev", serial_hd(0));
++    }
++    sysbus_realize(SYS_BUS_DEVICE(&s->uart), &error_fatal);
++    sysbus_mmio_map(SYS_BUS_DEVICE(&s->uart), 0,
++                    memmap[BRV32P_LINUX_DEV_UART].base);
++    sysbus_connect_irq(SYS_BUS_DEVICE(&s->uart), 0,
++                       qdev_get_gpio_in(DEVICE(&s->ext_irq), 1));
++
++    object_initialize_child(OBJECT(machine), "timer", &s->timer,
++                            TYPE_BRV32P_TIMER);
++    sysbus_realize(SYS_BUS_DEVICE(&s->timer), &error_fatal);
++    sysbus_mmio_map(SYS_BUS_DEVICE(&s->timer), 0,
++                    memmap[BRV32P_LINUX_DEV_TIMER].base);
++    sysbus_connect_irq(SYS_BUS_DEVICE(&s->timer), 0,
++                       qdev_get_gpio_in(cpu_dev, IRQ_M_TIMER));
++
++    /* Boot: firmware at the start of RAM, kernel after it, the DT at the top */
++    if (!machine->dtb) {
++        error_report("brv32p-linux: a device tree is needed (-dtb)");
++        exit(EXIT_FAILURE);
++    }
++    machine->fdt = load_device_tree(machine->dtb, &fdt_size);
++    if (!machine->fdt) {
++        error_report("load_device_tree() failed");
++        exit(EXIT_FAILURE);
++    }
++
++    firmware_start = memmap[BRV32P_LINUX_DEV_DRAM].base;
++    /* The DT describes 128 MiB; -m changes it */
++    qemu_fdt_setprop_cells(machine->fdt, "/memory@80000000", "reg",
++                           memmap[BRV32P_LINUX_DEV_DRAM].base,
++                           (uint32_t)machine->ram_size);
++    riscv_boot_info_init_discontig_mem(&boot_info, &s->soc,
++                                       memmap[BRV32P_LINUX_DEV_DRAM].base,
++                                       machine->ram_size);
++    firmware_end_addr = riscv_find_and_load_firmware(machine, &boot_info,
++        riscv_default_firmware_name(&s->soc), &firmware_start, NULL);
++    if (machine->kernel_filename) {
++        kernel_start_addr = riscv_calc_kernel_start_addr(&boot_info,
++                                                         firmware_end_addr);
++        riscv_load_kernel(machine, &boot_info, kernel_start_addr, true, NULL);
++        kernel_entry = boot_info.image_low_addr;
++    }
++    fdt_load_addr = riscv_compute_fdt_addr(memmap[BRV32P_LINUX_DEV_DRAM].base,
++                                           machine->ram_size, machine,
++                                           &boot_info);
++    riscv_load_fdt(fdt_load_addr, machine->fdt);
++
++    /* The reset vector, in the boot SRAM at 0 (the RTL's reset address) */
++    riscv_setup_rom_reset_vec(machine, &s->soc, firmware_start,
++                              memmap[BRV32P_LINUX_DEV_SRAM].base,
++                              memmap[BRV32P_LINUX_DEV_SRAM].size,
++                              kernel_entry, fdt_load_addr);
++}
++
++static void brv32p_linux_machine_class_init(ObjectClass *oc, const void *data)
++{
++    MachineClass *mc = MACHINE_CLASS(oc);
++
++    mc->desc = "RISC-V BRV32P SoC with the additions Linux needs "
++               "(RV32IMAC, S-mode, Sv32, ACLINT, 128 MiB RAM)";
++    mc->init = brv32p_linux_machine_init;
++    mc->max_cpus = 1;
++    mc->default_cpu_type = TYPE_RISCV_CPU_BRV32P_LINUX;
++    mc->default_ram_id = "riscv.brv32p.dram";
++    mc->default_ram_size = brv32p_linux_memmap[BRV32P_LINUX_DEV_DRAM].size;
++}
++
++static const TypeInfo brv32p_linux_machine_types[] = {
++    {
++        .name           = TYPE_BRV32P_LINUX_MACHINE,
++        .parent         = TYPE_MACHINE,
++        .instance_size  = sizeof(BRV32PLinuxState),
++        .class_init     = brv32p_linux_machine_class_init,
++        .interfaces     = riscv32_machine_interfaces,
++    }
++};
++
++DEFINE_TYPES(brv32p_linux_machine_types)
+diff --git a/hw/riscv/meson.build b/hw/riscv/meson.build
+index 236cf04..b89d819 100644
+--- a/hw/riscv/meson.build
++++ b/hw/riscv/meson.build
+@@ -5,6 +5,7 @@ riscv_ss.add(files('fdt-common.c'))
+ riscv_ss.add(when: 'CONFIG_RISCV_NUMA', if_true: files('numa.c'))
+ riscv_ss.add(files('riscv_hart.c'))
+ riscv_ss.add(when: 'CONFIG_BRV32P', if_true: files('brv32p.c'))
++riscv_ss.add(when: 'CONFIG_BRV32P_LINUX', if_true: files('brv32p_linux.c'))
+ riscv_ss.add(when: 'CONFIG_OPENTITAN', if_true: files('opentitan.c'))
+ riscv_ss.add(when: 'CONFIG_RISCV_VIRT', if_true: files('virt.c'))
+ riscv_ss.add(when: 'CONFIG_SHAKTI_C', if_true: files('shakti_c.c'))
+diff --git a/include/hw/riscv/brv32p_linux.h b/include/hw/riscv/brv32p_linux.h
+new file mode 100644
+index 0000000..b66f666
+--- /dev/null
++++ b/include/hw/riscv/brv32p_linux.h
+@@ -0,0 +1,48 @@
++/*
++ * BRV32P Linux machine
++ *
++ * Copyright (c) 2026 Brendan Lynskey
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#ifndef HW_RISCV_BRV32P_LINUX_H
++#define HW_RISCV_BRV32P_LINUX_H
++
++#include "hw/core/boards.h"
++#include "hw/core/or-irq.h"
++#include "hw/char/brv32p_uart.h"
++#include "hw/gpio/brv32p_gpio.h"
++#include "hw/riscv/riscv_hart.h"
++#include "hw/timer/brv32p_timer.h"
++
++#define TYPE_BRV32P_LINUX_MACHINE MACHINE_TYPE_NAME("brv32p-linux")
++typedef struct BRV32PLinuxState BRV32PLinuxState;
++DECLARE_INSTANCE_CHECKER(BRV32PLinuxState, BRV32P_LINUX_MACHINE,
++                         TYPE_BRV32P_LINUX_MACHINE)
++
++struct BRV32PLinuxState {
++    /*< private >*/
++    MachineState parent_obj;
++
++    /*< public >*/
++    RISCVHartArrayState soc;
++    MemoryRegion sram;
++    MemoryRegion gpio_alias[13];
++    BRV32PGPIOState gpio;
++    BRV32PUARTState uart;
++    BRV32PTimerState timer;
++    OrIRQState ext_irq;
++};
++
++enum {
++    BRV32P_LINUX_DEV_SRAM,
++    BRV32P_LINUX_DEV_GPIO,
++    BRV32P_LINUX_DEV_UART,
++    BRV32P_LINUX_DEV_TIMER,
++    BRV32P_LINUX_DEV_CLINT,
++    BRV32P_LINUX_DEV_TEST,
++    BRV32P_LINUX_DEV_DRAM,
++};
++
++#endif /* HW_RISCV_BRV32P_LINUX_H */
+diff --git a/target/riscv/cpu-qom.h b/target/riscv/cpu-qom.h
+index c1bcad3..6852deb 100644
+--- a/target/riscv/cpu-qom.h
++++ b/target/riscv/cpu-qom.h
+@@ -43,6 +43,7 @@
+ #define TYPE_RISCV_CPU_RVA23U64         RISCV_CPU_TYPE_NAME("rva23u64")
+ #define TYPE_RISCV_CPU_RVA23S64         RISCV_CPU_TYPE_NAME("rva23s64")
+ #define TYPE_RISCV_CPU_BRV32P           RISCV_CPU_TYPE_NAME("brv32p")
++#define TYPE_RISCV_CPU_BRV32P_LINUX     RISCV_CPU_TYPE_NAME("brv32p-linux")
+ #define TYPE_RISCV_CPU_IBEX             RISCV_CPU_TYPE_NAME("lowrisc-ibex")
+ #define TYPE_RISCV_CPU_SHAKTI_C         RISCV_CPU_TYPE_NAME("shakti-c")
+ #define TYPE_RISCV_CPU_SIFIVE_E         RISCV_CPU_TYPE_NAME("sifive-e")
+diff --git a/target/riscv/cpu.c b/target/riscv/cpu.c
+index e549a34..33525b4 100644
+--- a/target/riscv/cpu.c
++++ b/target/riscv/cpu.c
+@@ -3327,6 +3327,31 @@ static const TypeInfo riscv_cpu_type_infos[] = {
+         .cfg.ext_zknh = true
+     ),
+ 
++    /*
++     * brv32p-linux: the brv32p with what Linux needs added (A, S and U modes,
++     * Sv32, the cycle, time and instret counters with their high halves).
++     * It has no PMP, as the brv32p has none.
++     */
++    DEFINE_RISCV_CPU(TYPE_RISCV_CPU_BRV32P_LINUX, TYPE_RISCV_VENDOR_CPU,
++        .misa_mxl_max = MXL_RV32,
++        .misa_ext = RVI | RVM | RVA | RVC | RVS | RVU,
++        .priv_spec = PRIV_VERSION_1_12_0,
++        .cfg.max_satp_mode = VM_1_10_SV32,
++        .cfg.mmu = true,
++        .cfg.ext_zifencei = true,
++        .cfg.ext_zicsr = true,
++        .cfg.ext_zicntr = true,
++        .cfg.misaligned_trap = true,
++
++        .cfg.ext_zbkb = true,
++        .cfg.ext_zbkc = true,
++        .cfg.ext_zbkx = true,
++        .cfg.ext_zknd = true,
++        .cfg.ext_zkne = true,
++        .cfg.ext_zknh = true,
++        .cfg.ext_xbrvdsp = true
++    ),
++
+     DEFINE_RISCV_CPU(TYPE_RISCV_CPU_IBEX, TYPE_RISCV_VENDOR_CPU,
+         .misa_mxl_max = MXL_RV32,
+         .misa_ext = RVI | RVM | RVC | RVU,
+-- 
+2.54.0
+

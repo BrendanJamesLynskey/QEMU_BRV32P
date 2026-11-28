@@ -1,0 +1,10 @@
+# The no-MMU probe (stage 4 feasibility): rv32_defconfig with the MMU off, on top of kernel.fragment.
+# Same machine, same OpenSBI and SBI console; the kernel runs in S-mode but does not use Sv32. Without the
+# RISCV_M_MODE line a no-MMU kernel is built for M-mode (the default) and cannot run under OpenSBI.
+# CONFIG_MMU is not set
+CONFIG_NONPORTABLE=y
+CONFIG_ARCH_RV32I=y
+CONFIG_BINFMT_FLAT=y
+# CONFIG_BINFMT_ELF is not set
+# CONFIG_RISCV_M_MODE is not set
+# CONFIG_RISCV_ISA_ZICBOM is not set

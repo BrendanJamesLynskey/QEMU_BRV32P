@@ -302,3 +302,57 @@ jobs:
         with:
           name: brv32p-three-platforms
           path: tests/build/three-upload
+
+  linux-boot:
+    name: Boot Linux on brv32p-linux (OpenSBI, kernel, BusyBox initramfs)
+    needs: [test]
+    if: ${{ !cancelled() && needs.test.result == 'success' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential bc bison flex libssl-dev libelf-dev cpio unzip rsync wget \
+            file python3
+
+      - name: Restore the QEMU build (from the test job)
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            build/qemu/qemu-system-riscv32
+            build/qemu/contrib/plugins/libexeclog.so
+          key: qemu-${{ hashFiles('QEMU_VERSION', 'patches/*.patch', 'scripts/build.sh') }}
+          fail-on-cache-miss: true
+
+      # The kernel, OpenSBI and the initramfs, keyed on the build script, the configs, the DT and the OpenSBI patch
+      - name: Restore the images
+        id: images
+        uses: actions/cache/restore@v4
+        with:
+          path: linux/out
+          key: linux-images-${{ hashFiles('linux/build.sh', 'linux/brv32p_linux_defconfig', 'linux/kernel.fragment', 'linux/brv32p-linux.dts', 'linux/patches/**', 'linux/overlay/**') }}
+
+      - name: Build the images (Buildroot toolchain, kernel, OpenSBI, BusyBox)
+        if: steps.images.outputs.cache-hit != 'true'
+        run: JOBS="$(nproc)" linux/build.sh
+
+      - name: Save the images
+        if: steps.images.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: linux/out
+          key: linux-images-${{ hashFiles('linux/build.sh', 'linux/brv32p_linux_defconfig', 'linux/kernel.fragment', 'linux/brv32p-linux.dts', 'linux/patches/**', 'linux/overlay/**') }}
+
+      - name: Boot test
+        run: linux/boot_test.sh
+
+      - name: Upload the boot log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: brv32p-linux-boot
+          path: |
+            linux/out/boot.log
+            linux/out/versions.txt

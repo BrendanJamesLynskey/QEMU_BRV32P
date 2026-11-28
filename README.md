@@ -16,6 +16,7 @@ The repo is a **patch series against a pinned QEMU release**, not a QEMU tree. T
 | Q1 | the machine, the three peripherals, ELF loading with `tohost` exit; tests and CI | PR `q1-machine` |
 | Q2 | the custom extensions (Xbrvdsp, GF, mod-q) by decodetree, checked against the Spike library | PR `q2-extensions`: patch 0007, 126 ISA tests run, 11 in lockstep with Spike |
 | Q3 | one ELF on QEMU, Spike and RTL in CI | PR `q3-three-platforms`: 22 programs built once; [`docs/results_q3.md`](docs/results_q3.md) |
+| L1 | Linux stage 1: `-M brv32p-linux` (patch 0008), OpenSBI + Linux 7.1.13 + BusyBox build and boot test, decision record | PR `linux-stage1`: [`docs/linux.md`](docs/linux.md); `-M brv32p` unchanged |
 
 ## Build and run
 
@@ -50,6 +51,8 @@ The GPIO pins are the QOM properties `gpio-in` (writable) and `gpio-out` of `/ma
 | [`tests/machine/`](tests/machine) | the machine tests written for the model: [`timer.S`](tests/machine/timer.S), [`uart.S`](tests/machine/uart.S), [`gpio.S`](tests/machine/gpio.S) |
 | [`.github/workflows/ci.yml`](.github/workflows/ci.yml) | build QEMU (cached), install the RISC-V GCC as the core repo's CI does, run the tests, run the three platforms, upload the reports |
 | [`docs/results_q3.md`](docs/results_q3.md) | the Q3 table: every program, the platforms, the agreement, instructions compared, RTL cycles, SHA-256 of the ELFs |
+| [`docs/linux.md`](docs/linux.md) | the Linux decision record: what `-M brv32p-linux` adds, what the RTL must gain for stages 2 to 5, boot time, footprint, no-MMU result |
+| [`linux/`](linux) | the Linux software: [`build.sh`](linux/build.sh) (Buildroot: toolchain, kernel, OpenSBI with the BRV32P UART driver, BusyBox initramfs), [`boot_test.sh`](linux/boot_test.sh), [`brv32p-linux.dts`](linux/brv32p-linux.dts), the defconfig, kernel fragment, overlay and OpenSBI patch |
 | [`docs/pr/`](docs/pr) | the pull request bodies |
 
 ## Tests

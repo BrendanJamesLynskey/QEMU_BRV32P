@@ -1,0 +1,170 @@
+From: Brendan Lynskey <brendanlynskey@googlemail.com>
+Subject: [PATCH] lib: utils: serial: add the BRV32P UART driver
+
+A polled console driver and its FDT binding ("brv32p,uart") for the UART of
+the BRV32P SoC, enabled in the generic platform's defconfig.
+
+Signed-off-by: Brendan Lynskey <brendanlynskey@googlemail.com>
+---
+diff --git a/b/include/sbi_utils/serial/brv32p_uart.h b/include/sbi_utils/serial/brv32p_uart.h
+new file mode 100644
+index 0000000..5a0ff90
+--- /dev/null
++++ b/include/sbi_utils/serial/brv32p_uart.h
+@@ -0,0 +1,11 @@
++/*
++ * SPDX-License-Identifier: BSD-2-Clause
++ */
++#ifndef __SERIAL_BRV32P_UART_H__
++#define __SERIAL_BRV32P_UART_H__
++
++#include <sbi/sbi_types.h>
++
++int brv32p_uart_init(unsigned long base);
++
++#endif
+diff --git a/lib/utils/serial/Kconfig b/lib/utils/serial/Kconfig
+index e3589ca..cc87e26 100644
+--- a/lib/utils/serial/Kconfig
++++ b/lib/utils/serial/Kconfig
+@@ -9,6 +9,11 @@ config FDT_SERIAL
+ 
+ if FDT_SERIAL
+ 
++config FDT_SERIAL_BRV32P
++	bool "BRV32P UART FDT driver"
++	select SERIAL_BRV32P
++	default n
++
+ config FDT_SERIAL_CADENCE
+ 	bool "Cadence UART FDT driver"
+ 	select SERIAL_CADENCE
+@@ -84,6 +89,10 @@ config SERIAL_UART8250
+ 	bool "8250 UART support"
+ 	default n
+ 
++config SERIAL_BRV32P
++	bool "BRV32P UART support"
++	default n
++
+ config SERIAL_XILINX_UARTLITE
+ 	bool "Xilinx UART Lite support"
+ 	default n
+diff --git a/b/lib/utils/serial/brv32p-uart.c b/lib/utils/serial/brv32p-uart.c
+new file mode 100644
+index 0000000..69a1850
+--- /dev/null
++++ b/lib/utils/serial/brv32p-uart.c
+@@ -0,0 +1,49 @@
++/*
++ * SPDX-License-Identifier: BSD-2-Clause
++ *
++ * Console driver for the UART of the BRV32P SoC, polled: TXDATA at 0x0
++ * (a write is dropped while the transmitter is busy), RXDATA at 0x4 (a read
++ * clears rx_valid), STATUS at 0x8 (bit 0 tx_busy, bit 1 rx_valid).
++ */
++
++#include <sbi/riscv_io.h>
++#include <sbi/sbi_console.h>
++#include <sbi_utils/serial/brv32p_uart.h>
++
++#define UART_TXDATA	0x00
++#define UART_RXDATA	0x04
++#define UART_STATUS	0x08
++# define UART_STATUS_TX_BUSY	0x01
++# define UART_STATUS_RX_VALID	0x02
++
++static volatile char *brv32p_uart_base;
++
++static void brv32p_uart_putc(char ch)
++{
++	while (readl(brv32p_uart_base + UART_STATUS) & UART_STATUS_TX_BUSY)
++		;
++	writel(ch, brv32p_uart_base + UART_TXDATA);
++}
++
++static int brv32p_uart_getc(void)
++{
++	if (readl(brv32p_uart_base + UART_STATUS) & UART_STATUS_RX_VALID)
++		return readl(brv32p_uart_base + UART_RXDATA) & 0xff;
++
++	return -1;
++}
++
++static struct sbi_console_device brv32p_uart_console = {
++	.name = "brv32p-uart",
++	.console_putc = brv32p_uart_putc,
++	.console_getc = brv32p_uart_getc
++};
++
++int brv32p_uart_init(unsigned long base)
++{
++	brv32p_uart_base = (volatile char *)base;
++
++	sbi_console_set_device(&brv32p_uart_console);
++
++	return 0;
++}
+diff --git a/b/lib/utils/serial/fdt_serial_brv32p.c b/lib/utils/serial/fdt_serial_brv32p.c
+new file mode 100644
+index 0000000..6749b05
+--- /dev/null
++++ b/lib/utils/serial/fdt_serial_brv32p.c
+@@ -0,0 +1,30 @@
++/*
++ * SPDX-License-Identifier: BSD-2-Clause
++ */
++
++#include <sbi_utils/fdt/fdt_helper.h>
++#include <sbi_utils/serial/fdt_serial.h>
++#include <sbi_utils/serial/brv32p_uart.h>
++
++static int serial_brv32p_init(const void *fdt, int nodeoff,
++			      const struct fdt_match *match)
++{
++	uint64_t addr;
++	int rc;
++
++	rc = fdt_get_node_addr_size(fdt, nodeoff, 0, &addr, NULL);
++	if (rc)
++		return rc;
++
++	return brv32p_uart_init(addr);
++}
++
++static const struct fdt_match serial_brv32p_match[] = {
++	{ .compatible = "brv32p,uart" },
++	{ },
++};
++
++const struct fdt_driver fdt_serial_brv32p = {
++	.match_table = serial_brv32p_match,
++	.init = serial_brv32p_init,
++};
+diff --git a/lib/utils/serial/objects.mk b/lib/utils/serial/objects.mk
+index 7c973c8..c39c0e0 100644
+--- a/lib/utils/serial/objects.mk
++++ b/lib/utils/serial/objects.mk
+@@ -37,6 +37,10 @@ libsbiutils-objs-$(CONFIG_FDT_SERIAL_UART8250) += serial/fdt_serial_uart8250.o
+ carray-fdt_serial_drivers-$(CONFIG_FDT_SERIAL_XILINX_UARTLITE) += fdt_serial_xlnx_uartlite
+ libsbiutils-objs-$(CONFIG_FDT_SERIAL_XILINX_UARTLITE) += serial/fdt_serial_xlnx_uartlite.o
+ 
++carray-fdt_serial_drivers-$(CONFIG_FDT_SERIAL_BRV32P) += fdt_serial_brv32p
++libsbiutils-objs-$(CONFIG_FDT_SERIAL_BRV32P) += serial/fdt_serial_brv32p.o
++
++libsbiutils-objs-$(CONFIG_SERIAL_BRV32P) += serial/brv32p-uart.o
+ libsbiutils-objs-$(CONFIG_SERIAL_CADENCE) += serial/cadence-uart.o
+ libsbiutils-objs-$(CONFIG_SERIAL_GAISLER) += serial/gaisler-uart.o
+ libsbiutils-objs-$(CONFIG_SERIAL_RENESAS_SCIF) += serial/renesas_scif.o
+diff --git a/platform/generic/configs/defconfig b/platform/generic/configs/defconfig
+index aab1560..0651208 100644
+--- a/platform/generic/configs/defconfig
++++ b/platform/generic/configs/defconfig
+@@ -56,6 +56,7 @@ CONFIG_FDT_SERIAL_RENESAS_SCIF=y
+ CONFIG_FDT_SERIAL_SHAKTI=y
+ CONFIG_FDT_SERIAL_SIFIVE=y
+ CONFIG_FDT_SERIAL_LITEX=y
++CONFIG_FDT_SERIAL_BRV32P=y
+ CONFIG_FDT_SERIAL_UART8250=y
+ CONFIG_FDT_SERIAL_XILINX_UARTLITE=y
+ CONFIG_SERIAL_SEMIHOSTING=y

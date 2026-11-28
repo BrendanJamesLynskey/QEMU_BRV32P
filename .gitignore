@@ -3,3 +3,4 @@
 /build/
 tests/build/
 __pycache__/
+/linux/out/

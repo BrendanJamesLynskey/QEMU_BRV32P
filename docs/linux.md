@@ -18,9 +18,9 @@ leave `brv32p` carrying code paths its tests never run, and the brief requires `
 | Boot SRAM | 32 KB at 0 and aliased at 0x8000_0000 | 32 KB at 0 (the RTL's reset address) only; holds the reset vector |
 | RAM | none | 128 MiB at 0x8000_0000, fully decoded, no aliasing |
 | GPIO, UART, timer | 0x2000_0000, 0x2000_0100, 0x2000_0200 | the same, register-exact |
-| Timer and software interrupt | BRV32P timer on MTIP | the BRV32P timer is kept, and an ACLINT in the SiFive CLINT layout is added at 0x2001_0000: `msip` at +0, `mtimecmp` at +0x4000, `mtime` at +0xbff8, 10 MHz |
+| Timer and software interrupt | BRV32P timer on MTIP | the BRV32P timer is kept, and an ACLINT in the standard CLINT register layout is added at 0x2001_0000: `msip` at +0, `mtimecmp` at +0x4000, `mtime` at +0xbff8, 10 MHz |
 | Interrupt controller | none (GPIO or UART gives MEIP) | none; the same OR into MEIP |
-| Power-off | `tohost` | a finisher at 0x2002_0000 (QEMU's `sifive_test`) used by the SBI reset; a test aid, not an RTL requirement |
+| Power-off | `tohost` | a finisher at 0x2002_0000 (QEMU's test finisher device) used by the SBI reset; a test aid, not an RTL requirement |
 
 The device tree is [`linux/brv32p-linux.dts`](../linux/brv32p-linux.dts), passed with `-dtb`. OpenSBI
 (`fw_dynamic`) is loaded at 0x8000_0000 with `-bios`, the kernel after it, the initramfs after the kernel, and the
